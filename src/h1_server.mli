@@ -8,4 +8,5 @@ val serve : Engine.t
     kept alive and pipelined. Each handler runs in a fiber of its own. It
     returns when the connection must close. Examples: the client closed it or
     asked for a close, a request was malformed, the engine could not complete a
-    response, or the server stops. *)
+    response, or the server stops. With the ALPN protocol ["h2"], it reports a
+    [Failure] and returns at once. *)

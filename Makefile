@@ -1,5 +1,5 @@
 
-.PHONY: build fmt test mutate coverage autobahn h2spec
+.PHONY: build fmt test mutate coverage autobahn h2spec interop
 
 build:
 	dune build
@@ -85,3 +85,14 @@ h2spec:
 	for i in $$(seq 50); do grep -q '^listening' $(H2SPEC_LOG) && break; sleep 0.1; done; \
 	grep -q '^listening' $(H2SPEC_LOG) || { echo "The server did not start."; exit 1; }; \
 	h2spec -S -h 127.0.0.1 -p $(H2SPEC_PORT) -o 3 || { cat $(H2SPEC_LOG); exit 1; }
+
+# The interop tests of HTTP/2: curl, nghttp, h2load and h2spec (of the dev
+# shell) against Caravan_http2.auto with Server.http1, without TLS on
+# 127.0.0.1:$(INTEROP_PORT) and with TLS on the next port. The script
+# test/linux/interop.sh fails at the first check that fails, and shows the logs
+# of the servers. The dune root is the directory of this Makefile.
+INTEROP_PORT ?= 18450
+
+interop:
+	dune build --root . test/linux/interop_server.exe
+	test/linux/interop.sh ./_build/default/test/linux/interop_server.exe _build $(INTEROP_PORT)

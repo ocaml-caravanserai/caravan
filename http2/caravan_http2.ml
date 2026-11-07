@@ -1,5 +1,9 @@
 module Settings = Settings
 
+let engine = Select.engine
+
+let auto = Select.auto
+
 module Private = struct
   module Error = Error
   module Frame = Frame

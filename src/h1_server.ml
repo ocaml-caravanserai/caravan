@@ -116,7 +116,7 @@ let continue_before_switch response body =
 let internal_error () =
   Response.string ~status:Status.internal_server_error "Internal Server Error\n"
 
-let serve : Engine.t =
+let serve_http1 : Engine.t =
  fun ctx flow handler ->
   let config = ctx.config in
   let limits = limits config in
@@ -558,3 +558,20 @@ let serve : Engine.t =
     | `Linger ->
         linger config flow
   with Flow.Closed | Flow.Timeout -> ()
+
+(* A client that got the ALPN protocol h2 sends HTTP/2. The HTTP/1.1 engine
+   cannot serve it: the TLS configuration offers h2, but the inner engine is not
+   an HTTP/2 engine. That is an error of the configuration, thus the engine
+   reports it, and the server closes the connection. *)
+let serve : Engine.t =
+ fun ctx flow handler ->
+  match Conn_info.alpn ctx.conn with
+  | Some "h2" ->
+      ctx.config.on_error
+        (Failure
+           "Caravan.Server.http1: the ALPN protocol of the connection is h2. \
+            Use Caravan_http2.auto or Caravan_http2.engine." )
+        (Printexc.get_callstack 0
+         [@mutate off "the report has no stack: no test reads it"] )
+  | _ ->
+      serve_http1 ctx flow handler

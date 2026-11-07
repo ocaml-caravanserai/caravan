@@ -275,3 +275,24 @@
   (with-stdout-to
    readme_html.ml
    (run awk -v "section=HTML" -f %{dep:section.awk} %{dep:../README.md}))))
+
+; The example of the "HTTP/2" section of README.md, as readme_http2.ml.
+
+(executable
+ (name readme_http2)
+ (modules readme_http2)
+ (libraries
+  caravan
+  caravan.http2
+  caravan.tls
+  tls
+  x509
+  mirage-crypto-rng.unix
+  weft
+  weft.os))
+
+(rule
+ (action
+  (with-stdout-to
+   readme_http2.ml
+   (run awk -v "section=HTTP/2" -f %{dep:section.awk} %{dep:../README.md}))))

@@ -162,6 +162,83 @@ let raw_read ?(on_data = fun tls _ -> tls) tcp tls =
   in
   go tls ; Buffer.contents out
 
+(* A certificate with an RSA key, signed by its own key, and the key. ocaml-tls
+   drops the cipher suites with RSA signatures for a P-256 key: thus the rows of
+   these cipher suites need an RSA key. *)
+let rsa_leaf =
+  lazy
+    (let key = X509.Private_key.generate ~bits:2048 `RSA in
+     let dn =
+       [ X509.Distinguished_name.(
+           Relative_distinguished_name.singleton (CN (Common_name.v "localhost")) )
+       ]
+     in
+     let csr = Result.get_ok (X509.Signing_request.create dn key) in
+     let valid_from = Option.get (Ptime.of_float_s 1_577_836_800.)
+     and valid_until = Option.get (Ptime.of_float_s 2_208_988_800.) in
+     ( Result.get_ok
+         (X509.Signing_request.sign csr ~valid_from ~valid_until key dn)
+     , key ) )
+
+(* [signature_algorithms ciphers] are the signature algorithms of the key types
+   of [ciphers]. ocaml-tls 2.1.4 and later refuse a cipher list (of a server or
+   of a client) with no key type of each default signature algorithm, for
+   example the list of one ECDSA cipher suite. ocaml-tls gives the key type RSA
+   to the cipher suites of TLS 1.3, thus a list with one of them needs an RSA
+   algorithm, and an RSA key if the list has no ECDSA cipher suite. *)
+let signature_algorithms ciphers =
+  let has k =
+    List.exists (fun c -> Tls.Ciphersuite.ciphersuite_keytype c = k)
+  in
+  (if has `RSA ciphers then [`RSA_PSS_RSAENC_SHA256; `RSA_PKCS1_SHA256] else [])
+  @ if has `EC ciphers then [`ECDSA_SECP256R1_SHA256] else []
+
+(* [server_config ~rsa ~alpn ~version ~ciphers ~reneg ()] is a server
+   configuration with a new test certificate (a P-256 key), or with an RSA key
+   if [rsa]. It seeds the generator first, thus a test that uses it does not
+   depend on the tests before it. *)
+let server_config ?(rsa = false) ~alpn ?version ?ciphers ?reneg ?zero_rtt () =
+  seed () ;
+  let leaf, key =
+    if rsa then Lazy.force rsa_leaf
+    else
+      let _, leaf, key = Tls_support.pki () in
+      (leaf, key)
+  in
+  match
+    Tls.Config.server ?version ?ciphers
+      ?signature_algorithms:(Option.map signature_algorithms ciphers)
+      ?reneg ?zero_rtt
+      ~certificates:(`Single ([leaf], key))
+      ~alpn_protocols:alpn ()
+  with
+  | Ok c ->
+      c
+  | Error (`Msg m) ->
+      fail m
+
+(* An engine that serves nothing. *)
+let no_engine : Engine.t = fun _ _ _ -> ()
+
+(* [engine_refusal ~inner config] is the text of the refusal of [S.engine config
+   inner] ([no_engine] by default), or [None] if [S.engine] accepts it. *)
+let engine_refusal ?(inner = no_engine) config =
+  match S.engine config inner with
+  | (_ : Engine.t) ->
+      None
+  | exception Invalid_argument m ->
+      Some m
+
+(* [preface_reply ccfg] sends the preface of HTTP/2 and a SETTINGS frame on a
+   new TLS connection, and gives the reply up to the end. *)
+let preface_reply ccfg =
+  exchange ccfg
+    ( Caravan_http2.Private.Frame.preface
+    ^ "\x00\x00\x00\x04\x00\x00\x00\x00\x00" )
+
+let alpn_refusal =
+  "Caravan_tls.engine: the ALPN list has a protocol other than h2 and http/1.1"
+
 let engine_tests =
   group "The engine"
     [ test "a GET over TLS, with the scheme https" (fun () ->
@@ -451,27 +528,242 @@ let engine_tests =
               done ;
               T.settle t ;
               equal int n (Weft_sim.open_fds (T.sim t)) ) )
-    ; test "engine refuses h2, TLS 1.0 and a missing generator" (fun () ->
-          let is_invalid = function Invalid_argument _ -> true | _ -> false in
-          let scfg, _ = setup ~server_alpn:["h2"; "http/1.1"] () in
-          raises_match is_invalid (fun () ->
-              ignore (S.engine scfg Server.http1 : Engine.t) ) ;
-          let old_tls =
-            Result.get_ok
-              (Tls.Config.server ~version:(`TLS_1_0, `TLS_1_3)
-                 ~certificates:
-                   (let _, leaf, key = Tls_support.pki () in
-                    `Single ([leaf], key) )
-                 () )
+    ; test "Server.http1 with the ALPN protocol h2: a Failure, then the close"
+        (fun () ->
+          let scfg, ccfg =
+            setup ~server_alpn:["h2"; "http/1.1"] ~client_alpn:["h2"] ()
           in
-          raises_match is_invalid (fun () ->
-              ignore (S.engine old_tls Server.http1 : Engine.t) ) ;
-          let scfg, _ = setup () in
+          (* S.engine refuses Server.http1 itself with h2, but not an engine
+             that wraps it. *)
+          let http1 ctx flow handler = Server.http1 ctx flow handler in
+          T.run ~engine:(S.engine scfg http1) info (fun t ->
+              Weft_sim.set_posix (T.sim t) (Time.posix_of_unix_s t0) ;
+              let flow, epoch = S.client ccfg (Tcp.connect server_addr) in
+              equal (option string) (Some "h2") epoch.alpn_protocol ;
+              (* The engine sends nothing: close_notify, then the end. *)
+              equal string "" (read_all ~strict:true flow) ;
+              Flow.close flow ;
+              T.settle t ;
+              match T.take_errors t with
+              | [(Failure m, _)] ->
+                  equal string
+                    "Caravan.Server.http1: the ALPN protocol of the connection \
+                     is h2. Use Caravan_http2.auto or Caravan_http2.engine."
+                    m
+              | l ->
+                  failf "%d errors" (List.length l) ) )
+    ; test "auto over TLS: the engine of each ALPN protocol" (fun () ->
+          let scfg, _ = setup ~server_alpn:["h2"; "http/1.1"] () in
+          let engine = S.engine scfg (Caravan_http2.auto ()) in
+          T.run ~engine info (fun t ->
+              Weft_sim.set_posix (T.sim t) (Time.posix_of_unix_s t0) ;
+              (* The clients check no certificate: the test is about the
+                 selection of the engine. *)
+              let client alpn =
+                Result.get_ok
+                  (Tls.Config.client
+                     ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
+                     ~peer_name:Tls_support.localhost ~alpn_protocols:alpn () )
+              in
+              (* HTTP/2 with the fake client, on a new TLS connection. *)
+              let h2 alpn =
+                let flow, _ =
+                  S.client (client alpn) (Tcp.connect server_addr)
+                in
+                Fiber.scope (fun s ->
+                    let c = Fake_h2_client.connect s flow in
+                    Fake_h2_client.request c ~stream:1
+                      [ (":method", "GET")
+                      ; (":scheme", "https")
+                      ; (":path", "/")
+                      ; (":authority", "localhost") ] ;
+                    let r = Fake_h2_client.response c ~stream:1 in
+                    Fake_h2_client.close c ;
+                    Fake_h2_client.finish c ;
+                    Flow.close flow ;
+                    r.body )
+              in
+              let h1 alpn = body_of (exchange (client alpn) (get "/")) in
+              equal string "https h2" (h2 ["h2"; "http/1.1"]) ;
+              equal string "https http/1.1" (h1 ["http/1.1"]) ;
+              (* No ALPN over TLS: HTTP/1.1, also for the preface. *)
+              equal string "https none" (h1 []) ;
+              is_true ~msg:"HTTP/1.1"
+                (String.starts_with ~prefix:"HTTP/1.1 "
+                   (preface_reply (client [])) ) ;
+              no_errors t ) )
+    ; test "TLS 1.2, a CBC suite, no ALPN, the preface: no HTTP/2" (fun () ->
+          (* check accepts the CBC suite because the ALPN list has no h2. A
+             client that sends the preface with no ALPN gets HTTP/1.1, thus no
+             HTTP/2 goes over a cipher suite of the block list. *)
+          let cbc = `ECDHE_ECDSA_WITH_AES_128_CBC_SHA256 in
+          let scfg = server_config ~alpn:["http/1.1"] ~ciphers:[cbc] () in
+          T.run
+            ~engine:(S.engine scfg (Caravan_http2.auto ()))
+            info
+            (fun t ->
+              Weft_sim.set_posix (T.sim t) (Time.posix_of_unix_s t0) ;
+              let ccfg =
+                Result.get_ok
+                  (Tls.Config.client
+                     ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
+                     ~peer_name:Tls_support.localhost
+                     ~version:(`TLS_1_2, `TLS_1_2) ~ciphers:[cbc]
+                     ~signature_algorithms:(signature_algorithms [cbc])
+                     () )
+              in
+              is_true ~msg:"HTTP/1.1"
+                (String.starts_with ~prefix:"HTTP/1.1 " (preface_reply ccfg)) ;
+              no_errors t ) )
+    ; test "engine: the ALPN rows" (fun () ->
+          List.iter
+            (fun (alpn, want) ->
+              let name = "[" ^ String.concat "; " alpn ^ "]" in
+              equal ~msg:name (option string) want
+                (engine_refusal (server_config ~alpn ())) )
+            [ (["h2"; "http/1.1"], None)
+            ; (["http/1.1"; "h2"], None)
+            ; (["h2"], None)
+            ; (["http/1.1"], None)
+            ; ([], None)
+            ; (["h2c"], Some alpn_refusal)
+            ; (["h2"; "http/1.0"], Some alpn_refusal)
+            ; (["spdy/3"; "http/1.1"], Some alpn_refusal) ] )
+    ; test "engine: the cipher suite rows of h2 with TLS 1.2" (fun () ->
+          let cipher_refusal =
+            Some
+              "Caravan_tls.engine: with h2 and TLS 1.2, each cipher suite must \
+               have ECDHE or DHE and AEAD (Tls.Config.Ciphers.http2)"
+          in
+          List.iter
+            (fun (name, rsa, alpn, version, ciphers, want) ->
+              equal ~msg:name (option string) want
+                (engine_refusal (server_config ~rsa ~alpn ?version ~ciphers ())) )
+            [ ( "ECDHE and GCM"
+              , false
+              , ["h2"; "http/1.1"]
+              , None
+              , [`ECDHE_ECDSA_WITH_AES_128_GCM_SHA256]
+              , None )
+            ; ( "ECDHE and ChaCha20-Poly1305"
+              , false
+              , ["h2"]
+              , None
+              , [`ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256]
+              , None )
+            ; ( "the cipher suites of TLS 1.3, RSA key"
+              , true
+              , ["h2"]
+              , None
+              , [ `AES_128_GCM_SHA256
+                ; `AES_256_GCM_SHA384
+                ; `CHACHA20_POLY1305_SHA256 ]
+              , None )
+            ; ( "the default list of ocaml-tls, RSA key"
+              , true
+              , ["h2"]
+              , None
+              , Tls.Config.Ciphers.default
+              , None )
+            ; ( "DHE and GCM, RSA key"
+              , true
+              , ["h2"]
+              , None
+              , [`DHE_RSA_WITH_AES_128_GCM_SHA256]
+              , None )
+            ; ( "ECDHE and CBC"
+              , false
+              , ["h2"]
+              , None
+              , [`ECDHE_ECDSA_WITH_AES_128_CBC_SHA256]
+              , cipher_refusal )
+            ; ( "a GCM suite and a CBC suite"
+              , false
+              , ["h2"; "http/1.1"]
+              , None
+              , [ `ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+                ; `ECDHE_ECDSA_WITH_AES_256_CBC_SHA ]
+              , cipher_refusal )
+            ; ( "RSA key exchange and GCM, RSA key"
+              , true
+              , ["h2"]
+              , None
+              , [ `ECDHE_RSA_WITH_AES_128_GCM_SHA256
+                ; `RSA_WITH_AES_128_GCM_SHA256 ]
+              , cipher_refusal )
+            ; ( "DHE and CBC, RSA key"
+              , true
+              , ["h2"]
+              , None
+              , [`DHE_RSA_WITH_AES_128_CBC_SHA256]
+              , cipher_refusal )
+            ; ( "the supported list of ocaml-tls, RSA key"
+              , true
+              , ["h2"]
+              , None
+              , Tls.Config.Ciphers.supported
+              , cipher_refusal )
+            ; ( "CBC with http/1.1 only"
+              , false
+              , ["http/1.1"]
+              , None
+              , [`ECDHE_ECDSA_WITH_AES_128_CBC_SHA256]
+              , None )
+            ; ( "CBC with no ALPN list"
+              , false
+              , []
+              , None
+              , [`ECDHE_ECDSA_WITH_AES_128_CBC_SHA256]
+              , None )
+            ; ( "TLS 1.3 only: ocaml-tls drops the cipher suites of TLS 1.2"
+              , false
+              , ["h2"]
+              , Some (`TLS_1_3, `TLS_1_3)
+              , [`AES_128_GCM_SHA256; `ECDHE_ECDSA_WITH_AES_128_CBC_SHA256]
+              , None ) ] )
+    ; test "engine: Server.http1 with h2" (fun () ->
+          equal (option string)
+            (Some
+               "Caravan_tls.engine: the ALPN list has h2, but the inner engine \
+                is Caravan.Server.http1: use Caravan_http2.auto" )
+            (engine_refusal ~inner:Server.http1
+               (server_config ~alpn:["h2"; "http/1.1"] ()) ) ;
+          equal (option string) None
+            (engine_refusal ~inner:Server.http1
+               (server_config ~alpn:["http/1.1"] ()) ) ;
+          equal (option string) None
+            (engine_refusal ~inner:(Caravan_http2.auto ())
+               (server_config ~alpn:["h2"; "http/1.1"] ()) ) )
+    ; test "engine: early data" (fun () ->
+          equal (option string)
+            (Some
+               "Caravan_tls.engine: the configuration permits early data \
+                (zero_rtt)" )
+            (engine_refusal (server_config ~alpn:["http/1.1"] ~zero_rtt:1l ())) ;
+          equal (option string) None
+            (engine_refusal (server_config ~alpn:["http/1.1"] ~zero_rtt:0l ())) )
+    ; test "engine: renegotiation with h2" (fun () ->
+          equal (option string)
+            (Some
+               "Caravan_tls.engine: with h2, the configuration permits \
+                renegotiation" )
+            (engine_refusal (server_config ~alpn:["h2"] ~reneg:true ())) ;
+          equal (option string) None
+            (engine_refusal (server_config ~alpn:["http/1.1"] ~reneg:true ())) )
+    ; test "engine refuses TLS 1.0 and a missing generator" (fun () ->
+          equal (option string)
+            (Some "Caravan_tls.engine: the lowest version is before TLS 1.2")
+            (engine_refusal
+               (server_config ~alpn:["h2"] ~version:(`TLS_1_0, `TLS_1_3) ()) ) ;
+          let scfg = server_config ~alpn:[] () in
           Mirage_crypto_rng.unset_default_generator () ;
           Fun.protect ~finally:seed
           @@ fun () ->
-          raises_match is_invalid (fun () ->
-              ignore (S.engine scfg Server.http1 : Engine.t) ) ) ]
+          equal (option string)
+            (Some
+               "Caravan_tls.engine: no default generator: call \
+                Mirage_crypto_rng_unix.use_default () first" )
+            (engine_refusal scfg) ) ]
 
 (* A listener and a connection for the handshakes with no HTTP. *)
 let listen () = Net.listen (Net.Tcp ("server", 443))

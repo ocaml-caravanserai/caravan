@@ -72,3 +72,22 @@
   (= %{system} linux))
  (modules h2spec_server)
  (libraries caravan caravan.http2 weft weft.linux))
+
+; The server of make interop: Caravan_http2.auto, with or without TLS.
+
+(executable
+ (name interop_server)
+ (enabled_if
+  (= %{system} linux))
+ (modules interop_server)
+ (libraries
+  caravan
+  caravan.http2
+  caravan.tls
+  tls
+  tls_support
+  x509
+  ipaddr
+  mirage-crypto-rng.unix
+  weft
+  weft.linux))

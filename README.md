@@ -22,8 +22,8 @@ On another system, `Weft_os.run` raises `Failure`. The build compiles
 this example (examples/dune).
 
 > **Status:** the server, the client, WebSocket and the framework
-> layer are complete but young, and their API can change. HTTP/2,
-> HTTP/3 and a reverse proxy are not there yet.
+> layer are complete but young, and their API can change. The HTTP/2
+> engine is new. HTTP/3 and a reverse proxy are not there yet.
 
 ## Contents
 
@@ -47,6 +47,7 @@ this example (examples/dune).
 - [File uploads](#file-uploads)
 - [Static files](#static-files)
 - [TLS](#tls)
+- [HTTP/2](#http2)
 - [WebSocket](#websocket)
 - [Client](#client)
 - [Background jobs](#background-jobs)
@@ -75,6 +76,7 @@ them.
 | `caravan.html` | HTML elements and attributes, with escaping and URL checks | |
 | `caravan.jobs` | Background jobs in the process, with retries, that stop with the server. Durable jobs in a store of the application, unique jobs, schedules (`every`, `cron`) and recurring jobs | |
 | `caravan.tls` | The TLS server, with ALPN, and HTTPS for the client | weft-tls, tls, x509, domain-name, ipaddr, mirage-crypto-rng |
+| `caravan.http2` | The HTTP/2 server engine, and the selection of HTTP/2 or HTTP/1.1 for each connection | |
 | `caravan.testing` | A test host: it runs a handler stack and the client in the weft simulator, with no sockets | |
 
 The byte streams come from weft. `Caravan.Flow` is `Weft_flow.Flow` of
@@ -117,6 +119,7 @@ compile the examples of this README.
 | [static](examples/static/app.ml) | Static files: ETag, 304, ranges, directories, a hidden dot file |
 | [compress](examples/compress/app.ml) | gzip and deflate responses, a page with a secret not compressed (BREACH), compressed request bodies with a size limit |
 | [tls](examples/tls/app.ml) | HTTPS with a certificate for development, ALPN, HSTS |
+| [http2](examples/http2/app.ml) | HTTP/2 and HTTP/1.1 on one port over TLS, the selection without ALPN, many streams on one connection |
 | [client](examples/client/app.ml) | The HTTP client: a gateway sketch that streams to one upstream, timeouts, 502 and 504, and a program that fetches a URL |
 | [websocket](examples/websocket/app.ml) | A chat room: origins, a subprotocol, a broadcast that a peer that reads nothing delays for at most 5 s, ping, the close at a stop |
 | [jobs](examples/jobs/app.ml) | Background jobs in the process: retries, delays, a full queue, counts |
@@ -183,9 +186,9 @@ let handler = Handler.compose [auth] hello
 All libraries except `caravan.testing` depend on no world of weft:
 `caravan`, `caravan.client`, `caravan.websocket`, `caravan.router`,
 `caravan.middleware`, `caravan.session`, `caravan.auth`,
-`caravan.compress`, `caravan.static`, `caravan.html`, `caravan.jobs`
-and `caravan.tls`. They run in each world, for example the OS world
-(`Weft.run (module Weft_os)`) and the simulator of weft
+`caravan.compress`, `caravan.static`, `caravan.html`, `caravan.jobs`,
+`caravan.tls` and `caravan.http2`. They run in each world, for example
+the OS world (`Weft.run (module Weft_os)`) and the simulator of weft
 (`Weft_sim.run`). `caravan.testing` runs only in the simulator.
 
 [examples/hello](examples/hello/app.ml) has streamed responses, the
@@ -1071,8 +1074,13 @@ let () =
 ```
 
 - A request has the scheme `https`, and `Conn_info.alpn` tells the ALPN
-  protocol. The ALPN list of the configuration can have only
-  `http/1.1`, and its lowest version must be TLS 1.2 or later.
+  protocol. The ALPN list of the configuration can have `h2` and
+  `http/1.1`, and its lowest version must be TLS 1.2 or later. With
+  `h2`, the inner engine must serve HTTP/2 (see [HTTP/2](#http2)).
+  `Caravan.Server.http1` refuses a session with the protocol `h2`.
+- The engine refuses a configuration that permits the early data of
+  TLS 1.3 (`zero_rtt` above 0): an attacker can replay early data, and
+  caravan does not do the rules of RFC 8470.
 - The handshake has the deadline `header_timeout`, and a stop of the
   server ends it. A handshake that fails is not an error of the server:
   the server reports nothing.
@@ -1091,6 +1099,82 @@ let () =
   `Flow.Closed` to a read: it can be a truncation.
 
 [examples/tls](examples/tls/app.ml) has a full example, with a
+certificate for development.
+
+## HTTP/2
+
+The `caravan.http2` library serves HTTP/2 (RFC 9113, with HPACK of RFC
+7541). The handler is the same for HTTP/2 and HTTP/1.1: a request of
+HTTP/2 has the version `Http_2`. This program serves HTTP/2 and
+HTTP/1.1 on one port, over TLS:
+
+```ocaml
+let read_file path = In_channel.with_open_bin path In_channel.input_all
+
+let ok = function Ok v -> v | Error (`Msg m) -> failwith m
+
+let () =
+  Mirage_crypto_rng_unix.use_default () ;
+  let certs = ok (X509.Certificate.decode_pem_multiple (read_file "cert.pem")) in
+  let key = ok (X509.Private_key.decode_pem (read_file "key.pem")) in
+  (* The ALPN list: the client and the server agree on h2 or http/1.1. *)
+  let tls =
+    ok
+      (Tls.Config.server
+         ~certificates:(`Single (certs, key))
+         ~alpn_protocols:["h2"; "http/1.1"] () )
+  in
+  Caravan.Server.run
+    ~engine:(Caravan_tls.engine tls (Caravan_http2.auto ()))
+    (module Weft_os)
+    (fun req ->
+      Caravan.Response.string
+        (Caravan.Version.to_string (Caravan.Request.version req)) )
+```
+
+An engine serves the connections of a server (`?engine` of
+`Server.run` and `Server.start`):
+
+| Engine | It serves |
+|---|---|
+| `Caravan.Server.http1` | HTTP/1.1. The default engine. A connection with the ALPN protocol `h2` gets no response, and the server reports a `Failure`. `Caravan_tls.engine` refuses `Server.http1` itself with `h2` in the ALPN list. |
+| `Caravan_http2.engine ()` | HTTP/2 only. The client must start with the preface of HTTP/2: it knows that the server has HTTP/2 (prior knowledge, for example behind a proxy), or TLS selected `h2`. It closes a connection of HTTP/1.1 with no report: with `http/1.1` in the ALPN list of TLS too, use `auto`. |
+| `Caravan_http2.auto ()` | HTTP/2 and HTTP/1.1. The ALPN protocol `h2` selects HTTP/2. Another ALPN protocol, or TLS with no ALPN protocol, selects HTTP/1.1 (`?http1`, `Server.http1` by default): HTTP/2 over TLS needs ALPN (RFC 9113 section 3.3). With no TLS, `auto` compares the first bytes with the preface of HTTP/2 (24 bytes), within `header_timeout`. |
+| `Caravan_tls.engine tls inner` | TLS, then the engine `inner`, with the ALPN protocol of the session in `Conn_info.alpn`. |
+
+- Without TLS, `auto` also serves the two versions on one port:
+  `curl --http2-prior-knowledge` gets HTTP/2, and a plain `curl` gets
+  HTTP/1.1. An HTTP/1.1 request differs from the preface in its first 3
+  bytes, thus the comparison usually needs one read. `auto` does not do
+  the upgrade `Upgrade: h2c` of HTTP/1.1, which RFC 9113 removed.
+- With `h2` in its ALPN list and TLS 1.2 permitted, `Caravan_tls.engine`
+  refuses a cipher suite that RFC 9113 forbids: each one must have an
+  ephemeral key exchange (ECDHE or DHE) and an AEAD cipher. The
+  default list of ocaml-tls obeys this rule.
+- `Caravan_http2.Settings` holds the values of the SETTINGS frame of the
+  server (100 concurrent streams, windows of 64 KiB, a header table of
+  4 KiB) and the limits against floods: rapid reset (CVE-2023-44487),
+  floods of SETTINGS, PING, empty DATA or CONTINUATION, PRIORITY,
+  WINDOW_UPDATE, RST_STREAM and unknown frames, the CONTINUATION flood,
+  and HPACK bombs. A client over a limit gets GOAWAY
+  ENHANCE_YOUR_CALM. In the tests, these clients trip no limit: a fake
+  client that sends as a browser does, a fake client that sends PING
+  frames as gRPC-Go does during a download, and curl, nghttp, h2load
+  and h2spec. No real browser and no real gRPC client ran in the tests.
+- The timeouts of `Config` apply: `header_timeout` for the preface
+  and for each header block, `idle_timeout` with no stream, and the read
+  and write timeouts for each stream. A stop of the server sends GOAWAY:
+  the streams in progress finish.
+- The engine sends no server push. A response of HTTP/2 has no
+  connection fields: the engine drops them. `Response.upgrade` (for
+  example WebSocket) and a 2xx response to `CONNECT` (a tunnel) need
+  HTTP/1.1: under HTTP/2 the engine reports an error and sends 500.
+  A browser opens a WebSocket on a new connection of HTTP/1.1, because
+  the server does not offer WebSocket over HTTP/2 (RFC 8441).
+- h2spec (147 cases, strict) passes, and so do curl, nghttp and h2load
+  (`make h2spec` and `make interop`).
+
+[examples/http2](examples/http2/app.ml) has a full example, with a
 certificate for development.
 
 ## WebSocket
@@ -1397,8 +1481,9 @@ flake.lock pin.
 
 The repository includes a Nix flake. Its dev shell provides OCaml 5.5,
 dune, weft, http-date, windtrap, ppx_windtrap, ocaml-lsp, utop,
-ocamlformat and odoc. `nix build` builds the caravan package (all the
-libraries of the table in [Libraries](#libraries), with no tests).
+ocamlformat, odoc, and h2spec, curl and nghttp2 for the HTTP/2 tests.
+`nix build` builds the caravan package (all the libraries of the table
+in [Libraries](#libraries), with no tests).
 
 With [direnv](https://direnv.net) and
 [nix-direnv](https://github.com/nix-community/nix-direnv) installed,
@@ -1425,6 +1510,8 @@ make mutate     # mutation testing of the suites of test/, in parallel
 make mutate MUTATE=websocket/   # only the mutants of the files under a prefix
 make coverage   # test coverage report of the suites of test/
 make autobahn   # the Autobahn WebSocket test suite, with podman or docker
+make h2spec     # the h2spec suite of HTTP/2, strict (Linux)
+make interop    # curl, nghttp, h2load and h2spec over TLS against HTTP/2 (Linux)
 ```
 
 The suites of test/ run in the simulator of weft, thus they use no real
@@ -1432,8 +1519,9 @@ time and no real network. The suite of test/linux runs on Linux in the
 OS world of weft, with real sockets, signals and child processes.
 
 The CI (.github/workflows/ci.yml) runs `dune build`, `dune build @fmt`
-and `dune runtest` in the dev shell on Linux and macOS, and `nix build`
-on Linux, for each push to main and each pull request.
+and `dune runtest` in the dev shell on Linux and macOS, `make h2spec`
+and `make interop` on Linux, and `nix build` on Linux, for each push to
+main and each pull request.
 
 The programs of the examples use `Weft_os`, but we run them only on
 Linux. Their tests run in the simulator, as the suites of test/ do. Try

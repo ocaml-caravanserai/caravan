@@ -14,7 +14,12 @@ type t
 val http1 : Engine.t
 (** [http1] is the HTTP/1.1 engine, the default engine of {!start}. An engine
     that wraps another engine, for example the TLS engine of [caravan.tls], can
-    wrap it. *)
+    wrap it.
+
+    A connection with the ALPN protocol ["h2"] ({!Conn_info.alpn}) carries
+    HTTP/2. [http1] reports a [Failure] to [on_error] of the configuration and
+    closes the connection. To serve HTTP/2 also, use the engine
+    [Caravan_http2.auto] of the library [caravan.http2]. *)
 
 val start :
   ?config:Config.t -> ?engine:Engine.t -> Weft.Fiber.scope -> Handler.t -> t
