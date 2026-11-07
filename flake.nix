@@ -205,6 +205,10 @@
               odoc
               # make h2spec: the conformance suite of HTTP/2.
               pkgs.h2spec
+              # make interop: HTTP/2 clients (curl, and nghttp and h2load of
+              # nghttp2).
+              pkgs.curl
+              pkgs.nghttp2
             ];
           };
         }
