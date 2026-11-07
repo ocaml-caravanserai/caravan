@@ -11,13 +11,33 @@ let client = Weft_tls.client
 (* [refuse name m] raises [Invalid_argument] for the function [name]. *)
 let refuse name m = invalid_arg (Printf.sprintf "Caravan_tls.%s: %s" name m)
 
-(* [check name c] refuses the configurations that caravan cannot use. [name] is
-   the name of the function, for the message. *)
-let check name (c : Tls.Config.config) =
+(* [h2_cipher cs] is [true] if HTTP/2 permits the cipher suite [cs] with TLS
+   1.2: an ephemeral key exchange (ECDHE or DHE) and an AEAD cipher. These are
+   the cipher suites that are not in the block list of RFC 9113 appendix A (also
+   [Tls.Config.Ciphers.http2]). Each TLS 1.3 cipher suite is permitted. *)
+let h2_cipher cs =
+  let aead =
+    match Tls.Ciphersuite.ciphersuite_privprot cs with
+    | `AEAD _ ->
+        true
+    | `Block _ ->
+        false
+  in
+  Tls.Ciphersuite.ciphersuite_tls13 cs
+  || (Tls.Ciphersuite.ciphersuite_fs cs && aead)
+
+(* [check name ~server c] refuses the configurations that caravan cannot use.
+   [name] is the name of the function, for the message. [server] is [true] for
+   the configuration of a server. *)
+let check name ~server (c : Tls.Config.config) =
   let refuse = refuse name in
-  (* Caravan has only HTTP/1.1, and a peer that gets "h2" sends HTTP/2. *)
-  if List.exists (fun p -> p <> "http/1.1") c.alpn_protocols then
-    refuse "the ALPN list has a protocol other than http/1.1" ;
+  (* A server can have HTTP/2: a TLS engine wraps Caravan_http2.auto. The client
+     of caravan has only HTTP/1.1, and a server that gets "h2" sends HTTP/2. *)
+  let permitted p = p = "http/1.1" || (server && p = "h2") in
+  if not (List.for_all permitted c.alpn_protocols) then
+    refuse
+      ( if server then "the ALPN list has a protocol other than h2 and http/1.1"
+        else "the ALPN list has a protocol other than http/1.1" ) ;
   (* With TLS 1.0 and a CBC cipher, ocaml-tls puts an empty record before each
      write: each one costs in the budget of the peer. *)
   ( match fst c.protocol_versions with
@@ -25,6 +45,28 @@ let check name (c : Tls.Config.config) =
       refuse "the lowest version is before TLS 1.2"
   | `TLS_1_2 | `TLS_1_3 ->
       () ) ;
+  (* RFC 9113 section 9.2.2: HTTP/2 over TLS 1.2 uses no cipher suite of the
+     block list. With TLS 1.3 only, ocaml-tls keeps only the cipher suites of
+     TLS 1.3 in [c.ciphers], and each one obeys the rule. *)
+  if List.mem "h2" c.alpn_protocols && not (List.for_all h2_cipher c.ciphers)
+  then
+    refuse
+      "with h2 and TLS 1.2, each cipher suite must have ECDHE or DHE and AEAD \
+       (Tls.Config.Ciphers.http2)" ;
+  (* RFC 9113 section 9.2.1: HTTP/2 over TLS 1.2 has no renegotiation and no TLS
+     compression. ocaml-tls 2.1.3 refuses each renegotiation when [use_reneg] is
+     false (the default): a ClientHello after the handshake gets the alert
+     no_renegotiation and the session does not change, and the server sends no
+     HelloRequest. Thus [check] refuses [use_reneg] with h2. ocaml-tls has no
+     TLS compression: each ServerHello selects the method NULL, also when the
+     client offers another method. *)
+  if c.use_reneg && List.mem "h2" c.alpn_protocols then
+    refuse "with h2, the configuration permits renegotiation" ;
+  (* An attacker can replay the early data of TLS 1.3. Caravan does not do the
+     rules of RFC 8470 (the field Early-Data, the status 425), thus it accepts
+     no early data, with HTTP/1.1 and with HTTP/2. *)
+  if Int32.compare c.zero_rtt 0l > 0 then
+    refuse "the configuration permits early data (zero_rtt)" ;
   match Mirage_crypto_rng.default_generator () with
   | _ ->
       ()
@@ -86,7 +128,7 @@ let https_with ~client config =
      and a resumed session skips the check of the certificate. *)
   if Option.is_some c.cached_session || Option.is_some c.cached_ticket then
     refuse "the configuration has a cached session" ;
-  check "https" c ;
+  check "https" ~server:false c ;
   fun ~host tcp ->
     match peer config host with
     | None ->
@@ -120,7 +162,15 @@ let guard tcp ~handshake read =
     ()
 
 let engine config inner =
-  check "engine" (Tls.Config.of_server config) ;
+  let c = Tls.Config.of_server config in
+  check "engine" ~server:true c ;
+  (* A client that gets h2 sends HTTP/2, and Server.http1 refuses each such
+     connection. The check finds only Server.http1 itself, not an engine that
+     wraps it. *)
+  if List.mem "h2" c.alpn_protocols && inner == Caravan.Server.http1 then
+    refuse "engine"
+      "the ALPN list has h2, but the inner engine is Caravan.Server.http1: use \
+       Caravan_http2.auto" ;
   fun (ctx : Caravan.Engine.ctx) tcp handler ->
     let c = ctx.config in
     let deadline = Time.add Mono (Time.now Mono) c.header_timeout in

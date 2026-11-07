@@ -92,8 +92,10 @@ val https :
       at [https config], before a connection, if [config] has a peer name or an
       IP address (the URL gives them), or a cached session or ticket (ocaml-tls
       does not compare the name of a cached session with the host, and a resumed
-      session skips the check of the certificate). Also for the checks of
-      {!engine}: the ALPN list, the lowest version and the generator. *)
+      session skips the check of the certificate), if the ALPN list of [config]
+      has a protocol other than ["http/1.1"] (the client has only HTTP/1.1), if
+      the lowest version is before TLS 1.2, or if no default generator is set.
+*)
 
 val engine : Tls.Config.server -> Caravan.Engine.t -> Caravan.Engine.t
 (** [engine config inner] does the TLS handshake of each connection, then calls
@@ -109,13 +111,34 @@ val engine : Tls.Config.server -> Caravan.Engine.t -> Caravan.Engine.t
     - After [inner] returns, the engine sends [close_notify] if [inner] did not,
       then the end of the TCP stream, with the deadline [linger_timeout].
 
+    The ALPN list of [config] can have ["h2"] and ["http/1.1"]. With ["h2"],
+    [inner] must serve HTTP/2: for example [Caravan_http2.auto], which selects
+    the engine from the ALPN protocol of the session. {!Caravan.Server.http1}
+    refuses a session with ["h2"]: [engine] refuses [Caravan.Server.http1]
+    itself as [inner] with ["h2"], but not an engine that wraps it. With
+    ["http/1.1"] in the list too, use [Caravan_http2.auto], not
+    [Caravan_http2.engine]: [Caravan_http2.engine] serves HTTP/2 only, and it
+    closes a connection of HTTP/1.1 with no report.
+
     @raise Invalid_argument
-      if the ALPN list of [config] has a protocol other than ["http/1.1"]
-      (caravan has only HTTP/1.1, and a client that gets ["h2"] sends HTTP/2),
-      if the lowest version of [config] is before TLS 1.2 (with TLS 1.0,
-      ocaml-tls sends an empty record before each write, and each one costs in
-      the budget of the peer), or if no default generator is set (see {!rng}).
-*)
+      if:
+      - The ALPN list of [config] has a protocol other than ["h2"] and
+        ["http/1.1"].
+      - The lowest version of [config] is before TLS 1.2. With TLS 1.0,
+        ocaml-tls sends an empty record before each write, and each one costs in
+        the budget of the peer.
+      - The ALPN list has ["h2"], TLS 1.2 is permitted, and a cipher suite of
+        [config] does not have an ephemeral key exchange (ECDHE or DHE) and an
+        AEAD cipher. RFC 9113 section 9.2.2 forbids these cipher suites.
+        [Tls.Config.Ciphers.http2] and the default list of ocaml-tls obey this
+        rule.
+      - The ALPN list has ["h2"] and [config] permits renegotiation (RFC 9113
+        section 9.2.1).
+      - The ALPN list has ["h2"] and [inner] is [Caravan.Server.http1].
+      - [config] permits the early data of TLS 1.3 ([zero_rtt] above 0). An
+        attacker can replay early data, and caravan does not do the rules of RFC
+        8470.
+      - No default generator is set (see {!rng}). *)
 
 (**/**)
 

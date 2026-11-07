@@ -34,5 +34,4 @@ val write_ca : t -> string -> unit
 
 val server_config : t -> Tls.Config.server
 (** [server_config t] is a TLS configuration of a server with the server
-    certificate of [t], its key, and the ALPN protocol ["http/1.1"]. That is the
-    only ALPN protocol that [Caravan_tls.engine] permits. *)
+    certificate of [t], its key, and the ALPN protocol ["http/1.1"]. *)

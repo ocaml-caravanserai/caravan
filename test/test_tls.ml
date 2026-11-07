@@ -451,9 +451,9 @@ let engine_tests =
               done ;
               T.settle t ;
               equal int n (Weft_sim.open_fds (T.sim t)) ) )
-    ; test "engine refuses h2, TLS 1.0 and a missing generator" (fun () ->
+    ; test "engine refuses h2c, TLS 1.0 and a missing generator" (fun () ->
           let is_invalid = function Invalid_argument _ -> true | _ -> false in
-          let scfg, _ = setup ~server_alpn:["h2"; "http/1.1"] () in
+          let scfg, _ = setup ~server_alpn:["h2c"; "http/1.1"] () in
           raises_match is_invalid (fun () ->
               ignore (S.engine scfg Server.http1 : Engine.t) ) ;
           let old_tls =
