@@ -498,14 +498,16 @@ let config =
   ; write_timeout= Span.ms 300
   ; linger_timeout= Span.ms 100 }
 
-let ctx config =
+(* The context of an engine. [stop] is the stop of the server: it never comes by
+   default. *)
+let ctx ?(stop = Ivar.create ()) config =
   { Caravan.Engine.config
   ; conn=
       Conn_info.make ~id:1
         ~peer:(Net.Tcp ("127.0.0.1", 50000))
         ~local:(Net.Tcp ("127.0.0.1", 8080))
-        ()
-  ; is_stopping= (fun () -> false) }
+        ~stopping:(Ivar.read stop) ()
+  ; is_stopping= (fun () -> Option.is_some (Ivar.peek stop)) }
 
 (* What a run of the engine gives: the value of the test, the reports, and the
    probe of the connection at the end. *)
@@ -517,14 +519,18 @@ type 'a run =
 type engine =
   { await_engine: unit -> unit
   ; engine_ended: unit -> bool
+  ; abort: unit -> unit (* the server cancels the connection *)
   ; probe: H2_server.probe }
 
-(* [serve_with ~local ~config ~settings ~wrap sim handler f] runs the engine
-   with [handler] on a TCP pair, and [f c e] with a fake client [c] connected
-   with [settings] and the engine [e]. The engine gets the flow [wrap flow].
-   After [f], the client ends its stream, and the engine must return. *)
-let serve_with ?local ?(config = config) ?settings ?(wrap = Fun.id) sim handler
-    f =
+(* [serve_with ~local ~config ~settings ~wrap ~stop ~hooks sim handler f] runs
+   the engine with [handler] on a TCP pair, and [f c e] with a fake client [c]
+   connected with [settings] and the engine [e]. The engine gets the flow [wrap
+   flow], the stop [stop] and the hooks [hooks] (with its own [inspect]). After
+   [f], the client ends its stream, and the engine must return or be cancelled.
+   The server side ends its stream at the end of the engine, also after a
+   cancel. *)
+let serve_with ?local ?(config = config) ?settings ?(wrap = Fun.id) ?stop
+    ?(hooks = H2_server.no_hooks) sim handler f =
   let reports = ref [] and probe = ref None in
   let config =
     { config with
@@ -535,11 +541,14 @@ let serve_with ?local ?(config = config) ?settings ?(wrap = Fun.id) sim handler
           let flow = Tcp.flow server in
           let call =
             Sim_support.call ~name:"engine" s (fun () ->
-                H2_server.serve ?local
-                  ~hooks:
-                    {H2_server.no_hooks with inspect= (fun p -> probe := Some p)}
-                  (ctx config) (wrap flow) handler ;
-                try Flow.shutdown_send flow with Flow.Closed -> () )
+                Fun.protect
+                  ~finally:(fun () ->
+                    Fiber.shield (fun () ->
+                        try Flow.shutdown_send flow with Flow.Closed -> () ) )
+                  (fun () ->
+                    H2_server.serve ?local
+                      ~hooks:{hooks with inspect= (fun p -> probe := Some p)}
+                      (ctx ?stop config) (wrap flow) handler ) )
           in
           let c = Fake.connect ?settings s (Tcp.flow client) in
           let probe : H2_server.probe = Option.get !probe in
@@ -547,10 +556,12 @@ let serve_with ?local ?(config = config) ?settings ?(wrap = Fun.id) sim handler
             f c
               { await_engine= (fun () -> Sim_support.await call)
               ; engine_ended= (fun () -> Sim_support.ended sim call)
+              ; abort= (fun () -> Sim_support.cancel call)
               ; probe }
           in
           Fake.close c ;
-          Sim_support.await call ;
+          (* An abort cancels the engine. *)
+          ( try Sim_support.await call with Promise.Cancelled -> () ) ;
           Fake.finish c ;
           { value
           ; reports= List.rev !reports
@@ -558,8 +569,8 @@ let serve_with ?local ?(config = config) ?settings ?(wrap = Fun.id) sim handler
           ; records= probe.records ()
           ; live= probe.live () } ) )
 
-let serve ?local ?config ?settings ?wrap sim handler f =
-  serve_with ?local ?config ?settings ?wrap sim handler (fun c _ -> f c)
+let serve ?local ?config ?settings ?wrap ?stop sim handler f =
+  serve_with ?local ?config ?settings ?wrap ?stop sim handler (fun c _ -> f c)
 
 (* The time since [t0], in nanoseconds. *)
 let since t0 = Span.to_ns (Time.diff Mono (Time.now Mono) t0)
@@ -760,9 +771,10 @@ let dynamic_entry = "\x3f\xe1\x1f\x40\x05x-dyn\x03yes"
 (* [uses_entry fields] is the block of [fields], then the indexed field 62. *)
 let uses_entry fields = plain fields ^ "\xbe"
 
-(* A HEADERS frame with the block [block] and END_HEADERS. *)
-let headers_frame ?(end_stream = false) ?priority stream block =
-  Frame.Headers {stream; end_stream; end_headers= true; priority; block}
+(* A HEADERS frame with the block [block], and END_HEADERS by default. *)
+let headers_frame ?(end_stream = false) ?(end_headers = true) ?priority stream
+    block =
+  Frame.Headers {stream; end_stream; end_headers; priority; block}
 
 let reports = Testable.(list string)
 
@@ -770,12 +782,14 @@ let reports = Testable.(list string)
    in the engine or in its state. After an end with an error, W does not write
    the items of the streams, and the streams stay open: their records stay until
    the engine returns ([~error_end:true]). *)
-let clean_end ?(error_end = false) r =
+let clean_end ?(error_end = false) ?(block_open = false) r =
   equal reports [] r.reports ;
   equal Testable.int 0 r.live ;
   if not error_end then begin
     equal Testable.int 0 r.records ;
-    equal Testable.int 0 (Conn_state.known_streams r.state)
+    (* The state keeps the stream of a header block that did not end. *)
+    if not block_open then
+      equal Testable.int 0 (Conn_state.known_streams r.state)
   end
 
 (* [with_writer_blocked c f]: the client stops to read, and stream 1 gets a
@@ -1715,6 +1729,36 @@ let engine_tests =
                            Fake.data ~end_stream:true c ~stream:3 "" ) ) ) )
           in
           equal Testable.string "HEADERS 3 END_STREAM" r.value ;
+          clean_end r )
+    ; test
+        "a malformed frame after our END_STREAM is queued: RST \
+         FRAME_SIZE_ERROR (h2spec http2/6.3/2)" (fun () ->
+          (* The handler of stream 3 answers at once, and its END_STREAM waits
+             in the queue: the state has the stream as ended in the two
+             directions. Then a PRIORITY frame of 4 bytes comes. The RST
+             replaces the items of stream 3 that W did not take. *)
+          let answered = Ivar.create () in
+          let handler =
+            paths
+              [ ("/big", big)
+              ; ( "/204"
+                , fun _ ->
+                    Ivar.fill answered () ;
+                    Response.empty ~status:Status.no_content () ) ]
+          in
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~settings:opened sim handler (fun c ->
+                    briefs
+                      (with_writer_blocked sim c (fun () ->
+                           Fake.request c ~stream:3 (request ~path:"/204" ()) ;
+                           sync (Ivar.read answered) ;
+                           Weft_sim.settle sim ;
+                           Fake.send_raw c
+                             (H2_support.raw ~kind:2 ~stream:3
+                                "\000\000\000\001" ) ) ) ) )
+          in
+          equal Testable.string "RST_STREAM 3 FRAME_SIZE_ERROR" r.value ;
           clean_end r )
     ; test "a client reset after our END_STREAM is queued: no frame after it"
         (fun () ->
@@ -3180,5 +3224,728 @@ HEADERS 3 END_STREAM|}
                         (String.starts_with ~prefix:"SETTINGS [" first) ) ) ) )
     ]
 
+(* {1 The lifecycle of the connection} *)
+
+(* Short timers for the lifecycle tests. *)
+let timed = {config with header_timeout= Span.ms 200; idle_timeout= Span.ms 400}
+
+(* [wait_ivar iv] waits for [iv]. *)
+let wait_ivar iv = sync (Ivar.read iv)
+
+let is_goaway = function Frame.Goaway _ -> true | _ -> false
+
+let is_ack = function Frame.Ping {ack; _} -> ack | _ -> false
+
+(* [round_trip c]: the client sends a PING and waits for its ACK. R handled each
+   frame before the PING. *)
+let round_trip c =
+  Fake.send c (Ping {ack= false; data= "12345678"}) ;
+  ignore (Fake.frames_until c is_ack)
+
+(* The GOAWAY frame of the client with [code]. *)
+let goaway code = Frame.Goaway {last_stream= 0; code; debug= ""}
+
+(* The waits of R in a window where R waits only a few times: a busy loop gives
+   many more before the PING round trip of the window ends. *)
+let few_waits = 20
+
+(* The simulator does not see a busy loop of R as a livelock: probably it counts
+   the mutex or a ready [sync] as progress. Thus [counting ()] gives hooks that
+   count the waits of R, and that fail the test at once after [busy_limit]
+   entries of R in its steps, its waits and its guarded read. The second and the
+   third results give the count of the waits and of the steps. *)
+let busy_limit = 10_000
+
+let counting () =
+  let entries = Atomic.make 0
+  and waits = Atomic.make 0
+  and steps = Atomic.make 0 in
+  let enter () =
+    if Atomic.fetch_and_add entries 1 >= busy_limit then
+      raise (Sim_support.Failed "a busy loop of R")
+  in
+  ( { H2_server.no_hooks with
+      on_yield= enter
+    ; on_step= (fun () -> enter () ; Atomic.incr steps)
+    ; on_wait= (fun () -> enter () ; Atomic.incr waits) }
+  , (fun () -> Atomic.get waits)
+  , fun () -> Atomic.get steps )
+
+(* A handler that ends in the yield of R: after R read the state of its step
+   (one live stream), and before R reads the input. The handler fills [started],
+   then waits. After [arm ()], the hook [hooks.on_yield] releases it from the
+   second entry of the guarded read: the first entry can read the frame that the
+   test sent after the arm. On many domains, the first entry can come before the
+   arm, thus the test sends frames until [released ()]. [ended ()] is the time
+   of the end of the handler. *)
+type release =
+  { handler: Request.t -> Response.t
+  ; hooks: H2_server.hooks
+  ; started: unit Ivar.t
+  ; arm: unit -> unit
+  ; released: unit -> bool
+  ; ended: unit -> Clock.mono }
+
+let release_in_yield () =
+  let started = Ivar.create () and release = Ivar.create () in
+  let ended = ref None in
+  let entries = Atomic.make min_int and released = Atomic.make false in
+  let on_yield () =
+    if
+      Atomic.fetch_and_add entries 1 >= 1
+      && Atomic.compare_and_set released false true
+    then Ivar.fill release ()
+  in
+  { handler=
+      (fun req ->
+        Ivar.fill started () ;
+        wait_ivar release ;
+        ended := Some (Time.now Mono) ;
+        hello req )
+  ; hooks= {H2_server.no_hooks with on_yield}
+  ; started
+  ; arm= (fun () -> Atomic.set entries 0)
+  ; released= (fun () -> Atomic.get released)
+  ; ended= (fun () -> Option.get !ended) }
+
+let lifecycle_tests =
+  group "Engine lifecycle"
+    [ test "the end of the input with no stream: the engine returns at once"
+        (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve_with sim hello (fun c e ->
+                    let t0 = Time.now Mono in
+                    Fake.close c ; e.await_engine () ; since t0 ) )
+          in
+          equal Testable.int64 0L r.value ;
+          clean_end r )
+    ; test "a stop: GOAWAY with the last stream, the stream ends, then the end"
+        (fun () ->
+          let stop = Ivar.create () and release = Ivar.create () in
+          let handler req = wait_ivar release ; hello req in
+          let hooks, waits, _ = counting () in
+          let r =
+            Sim_support.run (fun sim ->
+                serve_with ~stop ~hooks sim handler (fun c e ->
+                    Fake.request c ~stream:1 get ;
+                    Weft_sim.settle sim ;
+                    let waits0 = waits () in
+                    let t0 = Time.now Mono in
+                    Ivar.fill stop () ;
+                    let goaway = show (Fake.next c) in
+                    let at = since t0 in
+                    (* A new stream after the GOAWAY: no response, but the state
+                       of HPACK takes its block. *)
+                    let before = e.probe.table_size () in
+                    Fake.send c
+                      (headers_frame ~end_stream:true 3
+                         (dynamic_entry ^ plain get) ) ;
+                    round_trip c ;
+                    let after = e.probe.table_size () in
+                    Ivar.fill release () ;
+                    let body = (Fake.response c ~stream:1).body in
+                    e.await_engine () ;
+                    Weft_sim.settle sim ;
+                    ( [ goaway
+                      ; Int64.to_string at
+                      ; body
+                      ; string_of_int before
+                      ; string_of_int after ]
+                    , Fake.take_all c
+                    , waits () - waits0 ) ) )
+          in
+          let texts, rest, waits = r.value in
+          equal
+            Testable.(list string)
+            [{|GOAWAY 1 NO_ERROR "the server stops"|}; "0"; "hello"; "0"; "40"]
+            texts ;
+          equal Testable.string "" (briefs rest) ;
+          (* R waited at least for the PING, and at most a few times. *)
+          equal Testable.bool true (waits >= 1 && waits < few_waits) ;
+          clean_end r )
+    ; test "a stop before the preface: the connection closes at once" (fun () ->
+          Sim_support.run (fun sim ->
+              Sim_support.with_pair sim (fun client server ->
+                  let stop = Ivar.create () in
+                  Ivar.fill stop () ;
+                  let t0 = Time.now Mono in
+                  H2_server.serve (ctx ~stop config) (Tcp.flow server) hello ;
+                  equal Testable.int64 0L (since t0) ;
+                  ignore client ) ) )
+    ; test
+        "an abort during a response: the handler is cancelled, no time passes"
+        (fun () ->
+          let record, events = log () in
+          let handler _ =
+            Response.stream (fun w ->
+                Body.Writer.write_string w "a" ;
+                Body.Writer.flush w ;
+                match sync never with
+                | () ->
+                    ()
+                | exception (Fiber.Cancelled _ as e) ->
+                    record "cancelled" ; raise e )
+          in
+          let r =
+            Sim_support.run (fun sim ->
+                serve_with sim handler (fun c e ->
+                    Fake.request c ~stream:1 get ;
+                    ignore (Fake.frames_until c is_data) ;
+                    let t0 = Time.now Mono in
+                    e.abort () ;
+                    Weft_sim.settle sim ;
+                    (e.engine_ended (), since t0, Fake.take_all c) ) )
+          in
+          let ended, time, rest = r.value in
+          equal Testable.(pair bool int64) (true, 0L) (ended, time) ;
+          equal Testable.string "" (briefs rest) ;
+          equal Testable.(list string) ["cancelled"] (events ()) )
+    ; test "idle: GOAWAY NO_ERROR at idle_timeout after the last stream"
+        (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve_with ~config:timed sim
+                  (paths
+                     [ ( "/slow"
+                       , fun req ->
+                           Time.sleep Mono (Span.ms 1000) ;
+                           hello req ) ] )
+                  (fun c e ->
+                    (* A stream longer than idle_timeout keeps the
+                       connection. *)
+                    Fake.request c ~stream:1 (request ~path:"/slow" ()) ;
+                    ignore (Fake.response c ~stream:1) ;
+                    let t0 = Time.now Mono in
+                    (* A PING does not start the idle time again. *)
+                    Time.sleep Mono (Span.ms 200) ;
+                    Fake.send c (Ping {ack= false; data= "12345678"}) ;
+                    ignore (Fake.next c) ;
+                    let goaway = show (Fake.next c) in
+                    let at = since t0 in
+                    e.await_engine () ; (goaway, at) ) )
+          in
+          equal
+            Testable.(pair string int64)
+            ({|GOAWAY 1 NO_ERROR "idle"|}, Span.to_ns timed.idle_timeout)
+            r.value ;
+          clean_end r )
+    ; test "idle_timeout shorter than header_timeout: GOAWAY at idle_timeout"
+        (fun () ->
+          (* The first SETTINGS frame moves the deadline from the preface timer
+             to the earlier idle timer: it kicks the watchdog. The client sends
+             no frame after it, not even the ACK of our SETTINGS. *)
+          Sim_support.run (fun sim ->
+              Sim_support.with_pair sim (fun client server ->
+                  Fiber.scope (fun s ->
+                      let flow = Tcp.flow client in
+                      let engine =
+                        Sim_support.call s (fun () ->
+                            H2_server.serve
+                              (ctx {config with idle_timeout= Span.ms 150})
+                              (Tcp.flow server) hello )
+                      in
+                      let t0 = Time.now Mono in
+                      let w = Writer.create flow and r = Reader.create flow in
+                      Writer.write_string w Frame.preface ;
+                      Frame.write w (Settings {ack= false; settings= []}) ;
+                      Writer.flush w ;
+                      let rec goaway () =
+                        match Frame.read r ~max_size:16384 with
+                        | Goaway _ as f ->
+                            brief f
+                        | _ ->
+                            goaway ()
+                      in
+                      let got = goaway () in
+                      let at = since t0 in
+                      Flow.shutdown_send flow ;
+                      Sim_support.await engine ;
+                      equal
+                        Testable.(pair string int64)
+                        ({|GOAWAY 0 NO_ERROR "idle"|}, Span.to_ns (Span.ms 150))
+                        (got, at) ) ) ) )
+    ; test "a request at the idle deadline: the GOAWAY, or a stale timer"
+        (fun () ->
+          (* At the idle deadline, the client sends a request. If the watchdog
+             runs first and R sees its wake first, the GOAWAY comes, and the
+             request is ignored. Else R reads the request first: then R finds
+             that no deadline passed, and kicks the watchdog. The idle GOAWAY
+             then comes at idle_timeout after the end of the stream. Some seeds
+             must give the second order. *)
+          let stale = Atomic.make 0 in
+          let run sim =
+            let ended = ref None in
+            let handler req =
+              ended := Some (Time.now Mono) ;
+              hello req
+            in
+            let hooks, _, _ = counting () in
+            let r =
+              serve_with ~config:timed ~hooks sim handler (fun c e ->
+                  Time.sleep Mono timed.idle_timeout ;
+                  Fake.request c ~stream:1 get ;
+                  let frames = Fake.frames_until c is_goaway in
+                  let at = Time.now Mono in
+                  e.await_engine () ;
+                  (briefs frames, at) )
+            in
+            let frames, at = r.value in
+            ( match !ended with
+            | None ->
+                equal Testable.string {|GOAWAY 0 NO_ERROR "idle"|} frames
+            | Some ended ->
+                Atomic.incr stale ;
+                equal Testable.string
+                  "HEADERS 1\n\
+                   DATA 1 5\n\
+                   DATA 1 0 END_STREAM\n\
+                   GOAWAY 1 NO_ERROR \"idle\""
+                  frames ;
+                equal Testable.int64
+                  (Span.to_ns timed.idle_timeout)
+                  (Span.to_ns (Time.diff Mono at ended)) ) ;
+            clean_end r
+          in
+          Sim_support.race ~seeds:50 run ;
+          equal Testable.bool true (Atomic.get stale > 0) )
+    ; test "no preface: the connection closes at header_timeout" (fun () ->
+          Sim_support.run (fun sim ->
+              Sim_support.with_pair sim (fun client server ->
+                  let t0 = Time.now Mono in
+                  let server = Tcp.flow server in
+                  H2_server.serve (ctx timed) server hello ;
+                  equal Testable.int64
+                    (Span.to_ns timed.header_timeout)
+                    (since t0) ;
+                  Flow.shutdown_send server ;
+                  equal Testable.string "" (read_all (Tcp.flow client)) ) ) )
+    ; test "the preface with no SETTINGS frame: the close at header_timeout"
+        (fun () ->
+          Sim_support.run (fun sim ->
+              Sim_support.with_pair sim (fun client server ->
+                  Fiber.scope (fun s ->
+                      let flow = Tcp.flow client in
+                      let engine =
+                        Sim_support.call s (fun () ->
+                            H2_server.serve (ctx timed) (Tcp.flow server) hello )
+                      in
+                      let t0 = Time.now Mono in
+                      Flow.write_string flow Frame.preface ;
+                      Sim_support.await engine ;
+                      equal Testable.int64
+                        (Span.to_ns timed.header_timeout)
+                        (since t0) ) ) ) )
+    ; test "a header block that does not end: GOAWAY ENHANCE_YOUR_CALM"
+        (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~config:timed sim hello (fun c ->
+                    let t0 = Time.now Mono in
+                    Fake.send c
+                      (headers_frame ~end_stream:true ~end_headers:false 1
+                         (plain get) ) ;
+                    let goaway = show (Fake.next c) in
+                    (goaway, since t0) ) )
+          in
+          equal
+            Testable.(pair string int64)
+            ( {|GOAWAY 1 ENHANCE_YOUR_CALM "a header block that did not end in time"|}
+            , Span.to_ns timed.header_timeout )
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "a header block that ends in CONTINUATION: no header block timer"
+        (fun () ->
+          (* Stream 1 stays live for longer than header_timeout. *)
+          let release = Ivar.create () in
+          let handler req = wait_ivar release ; hello req in
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~config:timed sim handler (fun c ->
+                    let block = plain get in
+                    let half = String.length block / 2 in
+                    Fake.send c
+                      (headers_frame ~end_stream:true ~end_headers:false 1
+                         (String.sub block 0 half) ) ;
+                    Fake.send c
+                      (Continuation
+                         { stream= 1
+                         ; end_headers= true
+                         ; block=
+                             String.sub block half (String.length block - half)
+                         } ) ;
+                    Time.sleep Mono (Span.ms 300) ;
+                    Fake.request c ~stream:3 get ;
+                    Ivar.fill release () ;
+                    let b1 = (Fake.response c ~stream:1).body in
+                    let b3 = (Fake.response c ~stream:3).body in
+                    (b1, b3, briefs (Fake.take_all c)) ) )
+          in
+          equal
+            Testable.(triple string string string)
+            ("hello", "hello", "") r.value ;
+          clean_end r )
+    ; test "a CONTINUATION frame does not start the header block timer again"
+        (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~config:timed sim hello (fun c ->
+                    let block = plain get in
+                    let t0 = Time.now Mono in
+                    Fake.send c
+                      (headers_frame ~end_stream:true ~end_headers:false 1
+                         (String.sub block 0 1) ) ;
+                    Time.sleep Mono (Span.ms 150) ;
+                    Fake.send c
+                      (Continuation
+                         { stream= 1
+                         ; end_headers= false
+                         ; block= String.sub block 1 1 } ) ;
+                    let goaway = show (Fake.next c) in
+                    (goaway, since t0) ) )
+          in
+          equal
+            Testable.(pair string int64)
+            ( {|GOAWAY 1 ENHANCE_YOUR_CALM "a header block that did not end in time"|}
+            , Span.to_ns timed.header_timeout )
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "a header block that opens no stream fiber: GOAWAY at the idle time"
+        (fun () ->
+          (* The end of the block moves the deadline from the block timer (at
+             500 ms) to the earlier idle timer (at 400 ms): it kicks the
+             watchdog. The engine answers 417 with no fiber. *)
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~config:timed sim hello (fun c ->
+                    let t0 = Time.now Mono in
+                    let block =
+                      plain (request ~fields:[("expect", "foo")] ())
+                    in
+                    let half = String.length block / 2 in
+                    Time.sleep Mono (Span.ms 300) ;
+                    Fake.send c
+                      (headers_frame ~end_stream:true ~end_headers:false 1
+                         (String.sub block 0 half) ) ;
+                    Time.sleep Mono (Span.ms 50) ;
+                    Fake.send c
+                      (Continuation
+                         { stream= 1
+                         ; end_headers= true
+                         ; block=
+                             String.sub block half (String.length block - half)
+                         } ) ;
+                    let status = status_of (Fake.next c) in
+                    let goaway =
+                      show (Fake.frames_until c is_goaway |> List.rev |> List.hd)
+                    in
+                    (status, goaway, since t0) ) )
+          in
+          equal
+            Testable.(triple string string int64)
+            ("417", {|GOAWAY 1 NO_ERROR "idle"|}, Span.to_ns timed.idle_timeout)
+            r.value ;
+          clean_end r )
+    ; test
+        "the end of the input with cancel_on_disconnect: the handlers are \
+         cancelled" (fun () ->
+          let record, events = log () in
+          let handler _ =
+            match sync never with
+            | () ->
+                Response.string "never"
+            | exception (Fiber.Cancelled _ as e) ->
+                record "cancelled" ; raise e
+          in
+          let r =
+            Sim_support.run (fun sim ->
+                serve sim handler (fun c ->
+                    Fake.request c ~stream:1 get ;
+                    Fake.request c ~stream:3 get ;
+                    Weft_sim.settle sim ) )
+          in
+          equal Testable.(list string) ["cancelled"; "cancelled"] (events ()) ;
+          clean_end ~error_end:true r )
+    ; test "a GOAWAY NO_ERROR of the client: no new stream, the streams end"
+        (fun () ->
+          let release = Ivar.create () in
+          let handler req = wait_ivar release ; hello req in
+          let r =
+            Sim_support.run (fun sim ->
+                serve_with sim handler (fun c e ->
+                    Fake.request c ~stream:1 get ;
+                    Fake.send c (goaway No_error) ;
+                    Fake.request c ~stream:3 get ;
+                    Weft_sim.settle sim ;
+                    Ivar.fill release () ;
+                    let frames = Fake.frames_until c (ends 1) in
+                    e.await_engine () ;
+                    Weft_sim.settle sim ;
+                    briefs (frames @ Fake.take_all c) ) )
+          in
+          (* Our GOAWAY tells the last stream (RFC 9113 section 6.8). No frame
+             of stream 3. *)
+          equal Testable.string
+            "GOAWAY 1 NO_ERROR \"the client sent GOAWAY\"\n\
+             HEADERS 1\n\
+             DATA 1 5\n\
+             DATA 1 0 END_STREAM"
+            r.value ;
+          clean_end r )
+    ; test "a GOAWAY of the client with an error: the handler is cancelled"
+        (fun () ->
+          let record, events = log () in
+          let handler _ =
+            match sync never with
+            | () ->
+                Response.string "never"
+            | exception (Fiber.Cancelled _ as e) ->
+                record "cancelled" ; raise e
+          in
+          let r =
+            Sim_support.run (fun sim ->
+                serve_with sim handler (fun c e ->
+                    Fake.request c ~stream:1 get ;
+                    Weft_sim.settle sim ;
+                    Fake.send c (goaway Internal_error) ;
+                    e.await_engine () ) )
+          in
+          equal Testable.(list string) ["cancelled"] (events ()) ;
+          clean_end ~error_end:true r )
+    ; test "the last stream ends while R waits: GOAWAY at idle_timeout after it"
+        (fun () ->
+          (* This end does not wake R: R wakes at its check deadline. *)
+          let run sim =
+            let h = release_in_yield () in
+            let r =
+              serve_with ~config:timed ~hooks:h.hooks sim h.handler (fun c e ->
+                  Fake.request c ~stream:1 get ;
+                  wait_ivar h.started ;
+                  h.arm () ;
+                  while not (h.released ()) do
+                    round_trip c
+                  done ;
+                  ignore (Fake.frames_until c is_goaway) ;
+                  let at = Time.now Mono in
+                  e.await_engine () ;
+                  Span.to_ns (Time.diff Mono at (h.ended ())) )
+            in
+            equal Testable.int64 (Span.to_ns timed.idle_timeout) r.value ;
+            clean_end r
+          in
+          Sim_support.run run ;
+          Sim_support.race ~seeds:20 run )
+    ; test "the last stream ends while R waits in a drain: the end at once"
+        (fun () ->
+          (* The client sends GOAWAY NO_ERROR, then the handler ends in the
+             yield of R: the end must wake R. After the release, R ends the
+             drain and stops to read, thus a PING round trip can wait for ever.
+             The test sends PING frames with a pause of 1 ms in its place. *)
+          let run sim =
+            let h = release_in_yield () in
+            let r =
+              serve_with ~hooks:h.hooks sim h.handler (fun c e ->
+                  Fake.request c ~stream:1 get ;
+                  wait_ivar h.started ;
+                  Fake.send c (goaway No_error) ;
+                  round_trip c ;
+                  h.arm () ;
+                  while not (h.released ()) do
+                    Fake.send c (Ping {ack= false; data= "12345678"}) ;
+                    Time.sleep Mono (Span.ms 1)
+                  done ;
+                  e.await_engine () ;
+                  Span.to_ns (Time.diff Mono (Time.now Mono) (h.ended ())) )
+            in
+            (* R ends at once, then it lingers: the client does not close. *)
+            equal Testable.int64 (Span.to_ns config.linger_timeout) r.value ;
+            clean_end r
+          in
+          Sim_support.run run ;
+          Sim_support.race ~seeds:20 run )
+    ; test
+        "the end of the input after a request, no cancel: the response, no \
+         busy loop, no header block timer" (fun () ->
+          let release = Ivar.create () in
+          let handler req = wait_ivar release ; hello req in
+          let hooks, waits, steps = counting () in
+          let r =
+            Sim_support.run (fun sim ->
+                serve_with ~config:{timed with cancel_on_disconnect= false}
+                  ~hooks sim handler (fun c _ ->
+                    Fake.request c ~stream:1 get ;
+                    (* A header block that does not end before the end of the
+                       input. *)
+                    Fake.send c
+                      (headers_frame ~end_stream:true ~end_headers:false 3
+                         (plain get) ) ;
+                    Weft_sim.settle sim ;
+                    let before = waits () and steps0 = steps () in
+                    Fake.close c ;
+                    Weft_sim.settle sim ;
+                    let waits = waits () - before
+                    and steps = steps () - steps0 in
+                    (* The handler ends after header_timeout. *)
+                    Time.sleep Mono (Span.ms 300) ;
+                    Ivar.fill release () ;
+                    ((Fake.response c ~stream:1).body, waits, steps) ) )
+          in
+          let body, waits, steps = r.value in
+          equal Testable.string "hello" body ;
+          (* After the end of the input, R waits one time for each event, and
+             takes a few steps. *)
+          equal Testable.bool true (waits >= 1 && waits < few_waits) ;
+          equal Testable.bool true (steps >= 1 && steps < few_waits) ;
+          clean_end ~block_open:true r )
+    ; test "a header block timeout while a stream waits for credit: at once"
+        (fun () ->
+          (* Stream 1 waits for credit. The handler of stream 3 waits with no
+             write: only its cancel ends it. *)
+          let record, events = log () in
+          let handler =
+            paths
+              [ ( "/"
+                , fun _ ->
+                    Response.stream (fun w ->
+                        match Body.Writer.write_string w "abc" with
+                        | () ->
+                            ()
+                        | exception e ->
+                            record (Printexc.to_string e) ;
+                            raise e ) )
+              ; ( "/wait"
+                , fun _ ->
+                    match sync never with
+                    | () ->
+                        Response.string "never"
+                    | exception (Fiber.Cancelled _ as e) ->
+                        record "wait cancelled" ; raise e ) ]
+          in
+          let r =
+            Sim_support.run (fun sim ->
+                serve_with
+                  ~config:{timed with write_timeout= Span.s 1}
+                  ~settings:[(initial_window_size, 0)]
+                  sim handler
+                  (fun c e ->
+                    Fake.request c ~stream:1 get ;
+                    Fake.request c ~stream:3 (request ~path:"/wait" ()) ;
+                    Weft_sim.settle sim ;
+                    let t0 = Time.now Mono in
+                    Fake.send c
+                      (headers_frame ~end_stream:true ~end_headers:false 5
+                         (plain get) ) ;
+                    ignore (Fake.frames_until c is_goaway) ;
+                    Fake.close c ;
+                    e.await_engine () ;
+                    since t0 ) )
+          in
+          equal Testable.int64 (Span.to_ns timed.header_timeout) r.value ;
+          equal
+            Testable.(list string)
+            ["Weft_flow__Flow.Closed"; "wait cancelled"]
+            (List.sort compare (events ())) ;
+          clean_end ~error_end:true r )
+    ; test
+        "W waits with no live stream: Closing writes the items of the streams"
+        (fun () ->
+          (* The head of stream 1, a 204 with a field of 400000 bytes, is larger
+             than the buffers between W and the client: the TCP socket of the
+             simulator holds 144 KiB (a receive buffer of 128 KiB and a send
+             buffer of 16 KiB), and the client reads at most one frame after its
+             pause. In manual mode, no deadline fires while W waits. *)
+          let big =
+            String.init 400_000 (fun i -> "0123456789abcdef".[i * 7 mod 16])
+          in
+          let s3_ended = Ivar.create () in
+          let handler =
+            paths
+              [ ( "/big"
+                , fun _ ->
+                    Response.empty ~status:Status.no_content
+                      ~headers:(Headers.of_list [("x-big", big)])
+                      () )
+              ; ( "/small"
+                , fun _ ->
+                    Ivar.fill s3_ended () ;
+                    Response.empty ~status:Status.no_content () ) ]
+          in
+          let r =
+            Sim_support.manual (fun sim ->
+                serve sim handler (fun c ->
+                    let t0 = Time.now Mono in
+                    Fake.pause_reading c ;
+                    Fake.request c ~stream:1 (request ~path:"/big" ()) ;
+                    Weft_sim.settle sim ;
+                    Fake.request c ~stream:3 (request ~path:"/small" ()) ;
+                    wait_ivar s3_ended ;
+                    Weft_sim.settle sim ;
+                    Fake.send c (goaway No_error) ;
+                    Weft_sim.settle sim ;
+                    (* No GOAWAY came: the client reads one frame after its
+                       pause at most. *)
+                    let early = List.exists is_goaway (Fake.take_all c) in
+                    Fake.resume_reading c ;
+                    let r3 = show_response (Fake.response c ~stream:3) in
+                    (early, r3, since t0) ) )
+          in
+          equal
+            Testable.(triple bool string int64)
+            (false, "head :status=204", 0L)
+            r.value ;
+          clean_end r )
+    ; test "idle_timeout 0: GOAWAY at the end of the stream, no busy loop"
+        (fun () ->
+          (* The client sends the preface, its SETTINGS frame and a request in
+             one write, as curl does. The handler takes 50 ms. With no check
+             deadline, the end of the stream wakes R. *)
+          let handler req =
+            Time.sleep Mono (Span.ms 50) ;
+            hello req
+          in
+          let hooks, _, _ = counting () in
+          Sim_support.run (fun sim ->
+              Sim_support.with_pair sim (fun client server ->
+                  Fiber.scope (fun s ->
+                      let flow = Tcp.flow client in
+                      let engine =
+                        Sim_support.call s (fun () ->
+                            H2_server.serve ~hooks
+                              (ctx {config with idle_timeout= Span.zero})
+                              (Tcp.flow server) handler )
+                      in
+                      let t0 = Time.now Mono in
+                      let w = Writer.create flow and r = Reader.create flow in
+                      Writer.write_string w Frame.preface ;
+                      Frame.write w (Settings {ack= false; settings= []}) ;
+                      Frame.write w
+                        (headers_frame ~end_stream:true 1 (plain get)) ;
+                      Writer.flush w ;
+                      let rec frames acc =
+                        match Frame.read r ~max_size:16384 with
+                        | Goaway _ as f ->
+                            List.rev (f :: acc)
+                        | f ->
+                            frames (f :: acc)
+                      in
+                      let got = List.map brief (frames []) in
+                      let at = since t0 in
+                      Flow.shutdown_send flow ;
+                      Sim_support.await engine ;
+                      equal
+                        Testable.(list string)
+                        [ "SETTINGS [0x1=4096; 0x3=100; 0x4=65535; 0x6=16384]"
+                        ; "WINDOW_UPDATE 0 +6487965"
+                        ; "SETTINGS ACK []"
+                        ; "HEADERS 1"
+                        ; "DATA 1 5"
+                        ; "DATA 1 0 END_STREAM"
+                        ; {|GOAWAY 1 NO_ERROR "idle"|} ]
+                        got ;
+                      equal Testable.int64 (Span.to_ns (Span.ms 50)) at ) ) ) )
+    ]
+
 let () =
-  exit (Windtrap.run "h2_engine" [fake_client_tests; engine_tests; rule_tests])
+  exit
+    (Windtrap.run "h2_engine"
+       [fake_client_tests; engine_tests; rule_tests; lifecycle_tests] )
