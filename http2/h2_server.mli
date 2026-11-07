@@ -27,29 +27,31 @@
       abort of the server cancels the connection: then the engine does no end
       sequence.
 
-    This version does not have the limits of the flood protections.
+    The limits against floods are in [Settings]. A header block over
+    [4 * max_header_list_size] (at least 64 KiB) gets GOAWAY ENHANCE_YOUR_CALM
+    ([Conn_state]). With no ACK of our SETTINGS frame in [header_timeout]:
+    GOAWAY SETTINGS_TIMEOUT.
 
     A request body error (a content-length rule, malformed trailers) resets the
     stream, and a read of the body raises [Body.Truncated], but the engine does
     not cancel the handler: its fiber stays live, and counts for
     SETTINGS_MAX_CONCURRENT_STREAMS, until the handler ends. *)
 
-val default_local : Caravan.Config.t -> Conn_state.local
-(** [default_local config] is the default settings of the server: 100 concurrent
-    streams, an initial window of 65535, a header table of 4096 bytes, and
-    [config.max_header_bytes] for the header list. *)
-
 (** What the tests can examine after the end of the engine: the connection
     state, the number of the stream records of the engine, the number of the
     live stream fibers, the bytes of the buffers of the unread request DATA of
-    all streams, the number of the scratch buffers of W, and the size of the
-    dynamic table of the HPACK decoder. *)
+    all streams, the number of the scratch buffers of W, the number of the
+    stream visits of the rounds of W, the number of the streams out of the round
+    (they wait for stream window), and the size of the dynamic table of the
+    HPACK decoder. *)
 type probe =
   { state: Conn_state.t
   ; records: unit -> int
   ; live: unit -> int
   ; inbound: unit -> int
   ; scratch: unit -> int
+  ; visits: unit -> int
+  ; parked: unit -> int
   ; table_size: unit -> int }
 
 (** The hooks of the tests. The engine calls [inspect] one time, at its start,
@@ -67,9 +69,9 @@ type hooks =
 val no_hooks : hooks
 (** Hooks that do nothing. *)
 
-val serve : ?local:Conn_state.local -> ?hooks:hooks -> Caravan.Engine.t
-(** [serve ~local ~hooks ctx flow handler] serves the HTTP/2 connection [flow]
-    with [handler], and returns when the connection ends. The client must start
-    with the connection preface (prior knowledge, or ALPN [h2]). [local] is
-    [default_local ctx.config] by default. [Conn_state.validate] must accept it.
-    [hooks] is [no_hooks] by default. *)
+val serve : ?settings:Settings.t -> ?hooks:hooks -> Caravan.Engine.t
+(** [serve ~settings ~hooks ctx flow handler] serves the HTTP/2 connection
+    [flow] with [handler], and returns when the connection ends. The client must
+    start with the connection preface (prior knowledge, or ALPN [h2]).
+    [settings] is [Settings.default] by default. [Settings.validate] must accept
+    it. [hooks] is [no_hooks] by default. *)

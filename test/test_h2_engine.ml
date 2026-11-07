@@ -10,6 +10,7 @@ module Tcp = Caravan.Tcp
 module Reader = Weft_flow.Reader
 module Writer = Weft_flow.Writer
 module Fake = Fake_h2_client
+module Settings = Caravan_http2.Settings
 
 let show = H2_support.show
 
@@ -512,7 +513,12 @@ let ctx ?(stop = Ivar.create ()) config =
 (* What a run of the engine gives: the value of the test, the reports, and the
    probe of the connection at the end. *)
 type 'a run =
-  {value: 'a; reports: string list; state: Conn_state.t; records: int; live: int}
+  { value: 'a
+  ; reports: string list
+  ; state: Conn_state.t
+  ; records: int
+  ; live: int
+  ; parked: int }
 
 (* The engine of a test, for [f] of [serve_with]: the end of the engine, and its
    probe. *)
@@ -522,14 +528,14 @@ type engine =
   ; abort: unit -> unit (* the server cancels the connection *)
   ; probe: H2_server.probe }
 
-(* [serve_with ~local ~config ~settings ~wrap ~stop ~hooks sim handler f] runs
-   the engine with [handler] on a TCP pair, and [f c e] with a fake client [c]
-   connected with [settings] and the engine [e]. The engine gets the flow [wrap
-   flow], the stop [stop] and the hooks [hooks] (with its own [inspect]). After
-   [f], the client ends its stream, and the engine must return or be cancelled.
-   The server side ends its stream at the end of the engine, also after a
-   cancel. *)
-let serve_with ?local ?(config = config) ?settings ?(wrap = Fun.id) ?stop
+(* [serve_with ~h2 ~config ~settings ~wrap ~stop ~hooks sim handler f] runs the
+   engine with the settings [h2] and [handler] on a TCP pair, and [f c e] with a
+   fake client [c] connected with [settings] and the engine [e]. The engine gets
+   the flow [wrap flow], the stop [stop] and the hooks [hooks] (with its own
+   [inspect]). After [f], the client ends its stream, and the engine must return
+   or be cancelled. The server side ends its stream at the end of the engine,
+   also after a cancel. *)
+let serve_with ?h2 ?(config = config) ?settings ?(wrap = Fun.id) ?stop
     ?(hooks = H2_server.no_hooks) sim handler f =
   let reports = ref [] and probe = ref None in
   let config =
@@ -546,7 +552,7 @@ let serve_with ?local ?(config = config) ?settings ?(wrap = Fun.id) ?stop
                     Fiber.shield (fun () ->
                         try Flow.shutdown_send flow with Flow.Closed -> () ) )
                   (fun () ->
-                    H2_server.serve ?local
+                    H2_server.serve ?settings:h2
                       ~hooks:{hooks with inspect= (fun p -> probe := Some p)}
                       (ctx ?stop config) (wrap flow) handler ) )
           in
@@ -567,10 +573,11 @@ let serve_with ?local ?(config = config) ?settings ?(wrap = Fun.id) ?stop
           ; reports= List.rev !reports
           ; state= probe.state
           ; records= probe.records ()
-          ; live= probe.live () } ) )
+          ; live= probe.live ()
+          ; parked= probe.parked () } ) )
 
-let serve ?local ?config ?settings ?wrap ?stop sim handler f =
-  serve_with ?local ?config ?settings ?wrap ?stop sim handler (fun c _ -> f c)
+let serve ?h2 ?config ?settings ?wrap ?stop sim handler f =
+  serve_with ?h2 ?config ?settings ?wrap ?stop sim handler (fun c _ -> f c)
 
 (* The time since [t0], in nanoseconds. *)
 let since t0 = Span.to_ns (Time.diff Mono (Time.now Mono) t0)
@@ -779,14 +786,15 @@ let headers_frame ?(end_stream = false) ?(end_headers = true) ?priority stream
 let reports = Testable.(list string)
 
 (* The end of a test: no report, no live stream fiber, and no record of a stream
-   in the engine or in its state. After an end with an error, W does not write
-   the items of the streams, and the streams stay open: their records stay until
-   the engine returns ([~error_end:true]). *)
+   in the engine (also in its parked streams) or in its state. After an end with
+   an error, W does not write the items of the streams, and the streams stay
+   open: their records stay until the engine returns ([~error_end:true]). *)
 let clean_end ?(error_end = false) ?(block_open = false) r =
   equal reports [] r.reports ;
   equal Testable.int 0 r.live ;
   if not error_end then begin
     equal Testable.int 0 r.records ;
+    equal Testable.int 0 r.parked ;
     (* The state keeps the stream of a header block that did not end. *)
     if not block_open then
       equal Testable.int 0 (Conn_state.known_streams r.state)
@@ -1441,12 +1449,10 @@ let engine_tests =
           let handler =
             paths [("/wait", fun _ -> Ivar.fill !started () ; sync never)]
           in
-          let local =
-            {(H2_server.default_local config) with max_concurrent_streams= 4}
-          in
+          let h2 = {Settings.default with max_concurrent_streams= 4} in
           let r =
             Sim_support.run (fun sim ->
-                serve ~local sim handler (fun c ->
+                serve ~h2 sim handler (fun c ->
                     for i = 0 to 7 do
                       started := Ivar.create () ;
                       Fake.request c
@@ -1498,9 +1504,7 @@ let engine_tests =
             r.reports )
     ; test "a head over max_header_list_size: 431, the next one decodes"
         (fun () ->
-          let local =
-            {(H2_server.default_local config) with max_header_list_size= 1000}
-          in
+          let h2 = {Settings.default with max_header_list_size= Some 1000} in
           let handler req =
             Response.string
               (Option.value
@@ -1509,7 +1513,7 @@ let engine_tests =
           in
           let r =
             Sim_support.run (fun sim ->
-                serve ~local sim handler (fun c ->
+                serve ~h2 sim handler (fun c ->
                     Fake.send c
                       (headers_frame ~end_stream:true 1
                          ( dynamic_entry
@@ -1844,17 +1848,17 @@ let read_all flow =
 
 let rule_tests =
   group "Engine rules"
-    [ test "default_local: the default settings" (fun () ->
-          let l =
-            H2_server.default_local {config with max_header_bytes= 1234}
+    [ test "the default settings in our SETTINGS frame" (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~config:{config with max_header_bytes= 1234} sim hello
+                  (fun c -> Fake.server_settings c ) )
           in
           equal
-            Testable.(list int)
-            [100; 65535; 4096; 1234]
-            [ l.max_concurrent_streams
-            ; l.initial_window
-            ; l.header_table_size
-            ; l.max_header_list_size ] )
+            Testable.(list (pair int int))
+            [(0x1, 4096); (0x3, 100); (initial_window_size, 65535); (0x6, 1234)]
+            r.value ;
+          clean_end r )
     ; test "W serves the streams in turn: one DATA frame of each" (fun () ->
           let handler =
             paths
@@ -2796,12 +2800,10 @@ let rule_tests =
           in
           (* Two streams: a connection window of 131070, with a WINDOW_UPDATE at
              65535 bytes of credit. *)
-          let local =
-            {(H2_server.default_local config) with max_concurrent_streams= 2}
-          in
+          let h2 = {Settings.default with max_concurrent_streams= 2} in
           let r =
             Sim_support.run (fun sim ->
-                serve ~local sim handler (fun c ->
+                serve ~h2 sim handler (fun c ->
                     Fake.request ~end_stream:false c ~stream:1 (post ()) ;
                     ignore (Fake.response c ~stream:1) ;
                     Fake.data c ~stream:1 (String.make 65535 'x') ;
@@ -3308,6 +3310,33 @@ let release_in_yield () =
   ; released= (fun () -> Atomic.get released)
   ; ended= (fun () -> Option.get !ended) }
 
+(* [raw_client sim ~config ~h2 f]: the engine with [config] and [h2], and a
+   client that writes and reads frames by hand: [f w r] with the writer and the
+   reader of the client. The engine ends its side of the stream when it
+   returns. *)
+let raw_client sim ?(config = config) ?h2 f =
+  Sim_support.with_pair sim (fun client server ->
+      Fiber.scope (fun s ->
+          let flow = Tcp.flow client in
+          let engine =
+            Sim_support.call s (fun () ->
+                let server = Tcp.flow server in
+                H2_server.serve ?settings:h2 (ctx config) server hello ;
+                (* The client sees the end of the engine. *)
+                try Flow.shutdown_send server with Flow.Closed -> () )
+          in
+          let w = Writer.create flow and r = Reader.create flow in
+          let value = f w r in
+          Flow.shutdown_send flow ; Sim_support.await engine ; value ) )
+
+(* The client reads frames up to the first GOAWAY frame, and gives it. *)
+let rec read_goaway r =
+  match Frame.read r ~max_size:16384 with
+  | Goaway _ as f ->
+      brief f
+  | _ ->
+      read_goaway r
+
 let lifecycle_tests =
   group "Engine lifecycle"
     [ test "the end of the input with no stream: the engine returns at once"
@@ -3436,35 +3465,18 @@ let lifecycle_tests =
              to the earlier idle timer: it kicks the watchdog. The client sends
              no frame after it, not even the ACK of our SETTINGS. *)
           Sim_support.run (fun sim ->
-              Sim_support.with_pair sim (fun client server ->
-                  Fiber.scope (fun s ->
-                      let flow = Tcp.flow client in
-                      let engine =
-                        Sim_support.call s (fun () ->
-                            H2_server.serve
-                              (ctx {config with idle_timeout= Span.ms 150})
-                              (Tcp.flow server) hello )
-                      in
-                      let t0 = Time.now Mono in
-                      let w = Writer.create flow and r = Reader.create flow in
-                      Writer.write_string w Frame.preface ;
-                      Frame.write w (Settings {ack= false; settings= []}) ;
-                      Writer.flush w ;
-                      let rec goaway () =
-                        match Frame.read r ~max_size:16384 with
-                        | Goaway _ as f ->
-                            brief f
-                        | _ ->
-                            goaway ()
-                      in
-                      let got = goaway () in
-                      let at = since t0 in
-                      Flow.shutdown_send flow ;
-                      Sim_support.await engine ;
-                      equal
-                        Testable.(pair string int64)
-                        ({|GOAWAY 0 NO_ERROR "idle"|}, Span.to_ns (Span.ms 150))
-                        (got, at) ) ) ) )
+              raw_client sim
+                ~config:{config with idle_timeout= Span.ms 150}
+                (fun w r ->
+                  let t0 = Time.now Mono in
+                  Writer.write_string w Frame.preface ;
+                  Frame.write w (Settings {ack= false; settings= []}) ;
+                  Writer.flush w ;
+                  let got = read_goaway r in
+                  equal
+                    Testable.(pair string int64)
+                    ({|GOAWAY 0 NO_ERROR "idle"|}, Span.to_ns (Span.ms 150))
+                    (got, since t0) ) ) )
     ; test "a request at the idle deadline: the GOAWAY, or a stale timer"
         (fun () ->
           (* At the idle deadline, the client sends a request. If the watchdog
@@ -3483,7 +3495,11 @@ let lifecycle_tests =
             let hooks, _, _ = counting () in
             let r =
               serve_with ~config:timed ~hooks sim handler (fun c e ->
-                  Time.sleep Mono timed.idle_timeout ;
+                  (* Two sleeps: the second one starts after the watchdog armed
+                     its idle deadline (at the ACK deadline, 200 ms), thus at
+                     400 ms the watchdog runs first. *)
+                  Time.sleep Mono (Span.ms 250) ;
+                  Time.sleep Mono (Span.ms 150) ;
                   Fake.request c ~stream:1 get ;
                   let frames = Fake.frames_until c is_goaway in
                   let at = Time.now Mono in
@@ -3523,19 +3539,22 @@ let lifecycle_tests =
     ; test "the preface with no SETTINGS frame: the close at header_timeout"
         (fun () ->
           Sim_support.run (fun sim ->
-              Sim_support.with_pair sim (fun client server ->
-                  Fiber.scope (fun s ->
-                      let flow = Tcp.flow client in
-                      let engine =
-                        Sim_support.call s (fun () ->
-                            H2_server.serve (ctx timed) (Tcp.flow server) hello )
-                      in
-                      let t0 = Time.now Mono in
-                      Flow.write_string flow Frame.preface ;
-                      Sim_support.await engine ;
-                      equal Testable.int64
-                        (Span.to_ns timed.header_timeout)
-                        (since t0) ) ) ) )
+              raw_client sim ~config:timed (fun w r ->
+                  let t0 = Time.now Mono in
+                  Writer.write_string w Frame.preface ;
+                  Writer.flush w ;
+                  (* Our SETTINGS frame, then the close. *)
+                  let rec frames () =
+                    match Frame.read r ~max_size:16384 with
+                    | _ ->
+                        frames ()
+                    | exception (End_of_file | Flow.Closed) ->
+                        ()
+                  in
+                  frames () ;
+                  equal Testable.int64
+                    (Span.to_ns timed.header_timeout)
+                    (since t0) ) ) )
     ; test "a header block that does not end: GOAWAY ENHANCE_YOUR_CALM"
         (fun () ->
           let r =
@@ -3945,7 +3964,1104 @@ let lifecycle_tests =
                       equal Testable.int64 (Span.to_ns (Span.ms 50)) at ) ) ) )
     ]
 
+(* {1 The limits against floods} *)
+
+(* Small buckets with no refill, for the flood tests. *)
+let small = {Settings.default with frame_tokens= 5; frame_refill= 0}
+
+(* The first GOAWAY frame, as text: the client takes the frames up to it. *)
+let first_goaway c = brief (List.find is_goaway (Fake.frames_until c is_goaway))
+
+let priority stream =
+  Frame.Priority
+    {stream; priority= {exclusive= false; dependency= 0; weight= 15}}
+
+(* A frame of an unknown type on stream 0. *)
+let unknown = H2_support.raw ~kind:0xfa ~stream:0 ""
+
+let limits_tests =
+  group "Engine limits"
+    [ test "a flood of each frame class: GOAWAY ENHANCE_YOUR_CALM" (fun () ->
+          (* One frame more than the tokens of the bucket. *)
+          let flood ~last name send =
+            let r =
+              Sim_support.run (fun sim ->
+                  serve ~h2:small sim
+                    (fun _ -> sync never)
+                    (fun c -> send c ; first_goaway c) )
+            in
+            equal Testable.string
+              (sprintf {|GOAWAY %d ENHANCE_YOUR_CALM "a flood of %s frames"|}
+                 last name )
+              r.value ;
+            clean_end ~error_end:true r
+          in
+          let six f = List.init 6 f in
+          flood ~last:0 "SETTINGS" (fun c ->
+              Fake.send_all c
+                (six (fun _ -> Frame.Settings {ack= false; settings= []})) ) ;
+          flood ~last:0 "PING" (fun c ->
+              Fake.send_all c (six (fun _ -> ping "12345678")) ) ;
+          flood ~last:1 "empty DATA or CONTINUATION" (fun c ->
+              open_1 c ;
+              Fake.send_all c (six (fun _ -> data 1 "")) ) ;
+          flood ~last:0 "PRIORITY" (fun c ->
+              Fake.send_all c (six (fun _ -> priority 3)) ) ;
+          flood ~last:0 "WINDOW_UPDATE" (fun c ->
+              Fake.send_all c
+                (six (fun _ -> Frame.Window_update {stream= 0; increment= 1})) ) ;
+          flood ~last:0 "unknown" (fun c ->
+              Fake.send_raw c (String.concat "" (six (fun _ -> unknown))) ) )
+    ; test "the buckets get their tokens back in time" (fun () ->
+          (* 5 tokens, and 5 more in each second. The PING of the connect takes
+             one. *)
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~h2:{small with frame_refill= 5} sim hello (fun c ->
+                    Fake.send_all c (List.init 4 (fun _ -> ping "12345678")) ;
+                    Time.sleep Mono (Span.s 1) ;
+                    Fake.send_all c (List.init 5 (fun _ -> ping "12345678")) ;
+                    Weft_sim.settle sim ;
+                    let early = List.exists is_goaway (Fake.take_all c) in
+                    Fake.send c (ping "12345678") ;
+                    (early, first_goaway c) ) )
+          in
+          equal
+            Testable.(pair bool string)
+            (false, {|GOAWAY 0 ENHANCE_YOUR_CALM "a flood of PING frames"|})
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "each DATA frame of the engine gives 2 WINDOW_UPDATE tokens back"
+        (fun () ->
+          (* The client takes the 5 tokens. Then a body of 10000 bytes (one DATA
+             frame) gives 2 tokens back. *)
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~h2:small sim
+                  (fun _ -> Response.string (String.make 10000 'b'))
+                  (fun c ->
+                    let update =
+                      Frame.Window_update {stream= 0; increment= 1}
+                    in
+                    Fake.send_all c (List.init 5 (fun _ -> update)) ;
+                    Fake.request c ~stream:1 get ;
+                    ignore (Fake.response c ~stream:1) ;
+                    Fake.send_all c (List.init 2 (fun _ -> update)) ;
+                    Weft_sim.settle sim ;
+                    let early = List.exists is_goaway (Fake.take_all c) in
+                    Fake.send c update ;
+                    (early, first_goaway c) ) )
+          in
+          equal
+            Testable.(pair bool string)
+            ( false
+            , {|GOAWAY 1 ENHANCE_YOUR_CALM "a flood of WINDOW_UPDATE frames"|}
+            )
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "credit in small steps: small DATA frames give no token back"
+        (fun () ->
+          (* The stream window of the client is 0. Each credit costs 2 tokens. A
+             credit of 1024 bytes gives a DATA frame of 1024 bytes, which gives
+             the 2 tokens back. A credit of 1 byte gives a DATA frame of 1 byte,
+             which gives none. The client waits for each DATA frame before its
+             next credit. *)
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~h2:small
+                  ~settings:[(initial_window_size, 0)]
+                  sim
+                  (fun _ -> Response.string (String.make 4000 'b'))
+                  (fun c ->
+                    Fake.request c ~stream:1 get ;
+                    let small = ref [] in
+                    List.iter
+                      (fun n ->
+                        Fake.credit c ~stream:1 n ;
+                        small := !small @ Fake.frames_until c is_data )
+                      [1024; 1024; 1; 1] ;
+                    Fake.credit c ~stream:1 1 ;
+                    let frames = !small @ Fake.frames_until c is_goaway in
+                    ( List.length
+                        (List.filter
+                           (function
+                             | Frame.Data {data; _} ->
+                                 String.length data = 1
+                             | _ ->
+                                 false )
+                           frames )
+                    , brief (List.nth frames (List.length frames - 1)) ) ) )
+          in
+          equal
+            Testable.(pair int string)
+            (2, {|GOAWAY 1 ENHANCE_YOUR_CALM "a flood of WINDOW_UPDATE frames"|})
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "a new stream gives back one PRIORITY and one unknown token"
+        (fun () ->
+          let check name send =
+            let r =
+              Sim_support.run (fun sim ->
+                  serve ~h2:small sim hello (fun c ->
+                      send c 5 ;
+                      (* The request takes no token, and gives one back. *)
+                      Fake.request c ~stream:1 get ;
+                      ignore (Fake.response c ~stream:1) ;
+                      send c 1 ;
+                      Weft_sim.settle sim ;
+                      let early = List.exists is_goaway (Fake.take_all c) in
+                      send c 1 ;
+                      (early, first_goaway c) ) )
+            in
+            equal
+              Testable.(pair bool string)
+              ( false
+              , sprintf {|GOAWAY 1 ENHANCE_YOUR_CALM "a flood of %s frames"|}
+                  name )
+              r.value ;
+            clean_end ~error_end:true r
+          in
+          check "PRIORITY" (fun c n ->
+              Fake.send_all c (List.init n (fun _ -> priority 3)) ) ;
+          check "unknown" (fun c n ->
+              Fake.send_raw c
+                (String.concat "" (List.init n (fun _ -> unknown))) ) )
+    ; test "rapid reset: the resets before our head cost the budget" (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve
+                  ~h2:{Settings.default with reset_budget= Some 3}
+                  sim
+                  (fun _ -> sync never)
+                  (fun c ->
+                    for i = 0 to 3 do
+                      Fake.request c ~stream:((2 * i) + 1) get ;
+                      Fake.reset c ~stream:((2 * i) + 1) Cancel
+                    done ;
+                    first_goaway c ) )
+          in
+          equal Testable.string
+            {|GOAWAY 7 ENHANCE_YOUR_CALM "too many streams that end with no response"|}
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "rapid reset: a reset after our head costs nothing" (fun () ->
+          let handler =
+            paths
+              [ ( "/head"
+                , fun _ ->
+                    Response.stream (fun w ->
+                        Body.Writer.write_string w "a" ;
+                        Body.Writer.flush w ;
+                        sync never ) )
+              ; ("/", fun _ -> sync never) ]
+          in
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~h2:{Settings.default with reset_budget= Some 0}
+                  sim handler (fun c ->
+                    for i = 0 to 4 do
+                      let stream = (2 * i) + 1 in
+                      Fake.request c ~stream (request ~path:"/head" ()) ;
+                      ignore (Fake.frames_until c is_data) ;
+                      Fake.reset c ~stream Cancel
+                    done ;
+                    Weft_sim.settle sim ;
+                    let early = List.exists is_goaway (Fake.take_all c) in
+                    Fake.request c ~stream:11 get ;
+                    Fake.reset c ~stream:11 Cancel ;
+                    (early, first_goaway c) ) )
+          in
+          equal
+            Testable.(pair bool string)
+            ( false
+            , {|GOAWAY 11 ENHANCE_YOUR_CALM "too many streams that end with no response"|}
+            )
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "rapid reset: each response that ends gives 1 back" (fun () ->
+          let handler = paths [("/", hello); ("/wait", fun _ -> sync never)] in
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~h2:{Settings.default with reset_budget= Some 1}
+                  sim handler (fun c ->
+                    for i = 0 to 4 do
+                      let reset = (4 * i) + 1 and ok = (4 * i) + 3 in
+                      Fake.request c ~stream:reset (request ~path:"/wait" ()) ;
+                      Fake.reset c ~stream:reset Cancel ;
+                      Fake.request c ~stream:ok get ;
+                      ignore (Fake.response c ~stream:ok)
+                    done ;
+                    Weft_sim.settle sim ;
+                    List.exists is_goaway (Fake.take_all c) ) )
+          in
+          equal Testable.bool false r.value ;
+          clean_end r )
+    ; test "the stream-0 queue grows while W waits: GOAWAY over 10 frames"
+        (fun () ->
+          let run pings =
+            Sim_support.run (fun sim ->
+                serve
+                  ~h2:{Settings.default with control_queue= 10}
+                  sim
+                  (paths [("/big", big)])
+                  (fun c ->
+                    open_window c ;
+                    Fake.pause_reading c ;
+                    Fake.request c ~stream:1 (request ~path:"/big" ()) ;
+                    Weft_sim.settle sim ;
+                    Fake.send_all c (List.init pings (fun _ -> ping "12345678")) ;
+                    Weft_sim.settle sim ;
+                    Fake.resume_reading c ;
+                    if pings > 10 then first_goaway c
+                    else begin
+                      ignore (Fake.response c ~stream:1) ;
+                      Weft_sim.settle sim ;
+                      briefs (List.filter is_goaway (Fake.take_all c))
+                    end ) )
+          in
+          let r = run 10 in
+          equal Testable.string "" r.value ;
+          clean_end r ;
+          let r = run 11 in
+          equal Testable.string
+            {|GOAWAY 1 ENHANCE_YOUR_CALM "too many frames wait for stream 0"|}
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "a CONTINUATION flood: GOAWAY with no decode" (fun () ->
+          (* A header block over 64 KiB, the limit for a max_header_list_size of
+             1000. *)
+          let part = String.make 16384 'x' in
+          let r =
+            Sim_support.run (fun sim ->
+                serve
+                  ~h2:{Settings.default with max_header_list_size= Some 1000}
+                  sim hello (fun c ->
+                    Fake.send c
+                      (headers_frame ~end_stream:true ~end_headers:false 1 part) ;
+                    Fake.send_all c
+                      (List.init 4 (fun _ ->
+                           Frame.Continuation
+                             {stream= 1; end_headers= false; block= part} ) ) ;
+                    first_goaway c ) )
+          in
+          equal Testable.string
+            {|GOAWAY 1 ENHANCE_YOUR_CALM "header block too large"|} r.value ;
+          clean_end ~error_end:true ~block_open:true r )
+    ; test "an HPACK bomb: 431, then the next request" (fun () ->
+          (* A block of less than 1000 bytes (thus no 431 for its size): an
+             entry of 500 bytes in the dynamic table, and 300 references to it.
+             The block: a table size update to 4096 (\x3f\xe1\x1f), a literal
+             with incremental indexing of the new name x-a (\x40\x03x-a), the
+             value length 500 as an HPACK integer with a 7-bit prefix
+             (\x7f\xf5\x02), the value, the request, and index 62 (\xbe). Its
+             fields would take 160 KB. Only the limit of the list size of the
+             decoder applies: the limits of the HTTP/1.1 head are 1 MB and 10000
+             fields. *)
+          let bomb =
+            "\x3f\xe1\x1f\x40\x03x-a\x7f\xf5\x02" ^ String.make 500 'v'
+            ^ plain get ^ String.make 300 '\xbe'
+          in
+          equal Testable.bool true (String.length bomb < 1000) ;
+          let r =
+            Sim_support.run (fun sim ->
+                serve
+                  ~config:
+                    { config with
+                      max_header_bytes= 1_000_000
+                    ; max_header_count= 10_000 }
+                  ~h2:{Settings.default with max_header_list_size= Some 1000}
+                  sim hello (fun c ->
+                    Fake.send c (headers_frame ~end_stream:true 1 bomb) ;
+                    let r1 = show_response (Fake.response c ~stream:1) in
+                    Fake.request c ~stream:3 get ;
+                    [r1; (Fake.response c ~stream:3).body] ) )
+          in
+          equal
+            Testable.(list string)
+            ["head :status=431 content-length=0"; "hello"]
+            r.value ;
+          clean_end r )
+    ; test "a table size update over our table size: COMPRESSION_ERROR"
+        (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve sim hello (fun c ->
+                    Fake.send c
+                      (headers_frame ~end_stream:true 1
+                         ("\x3f\xe2\x1f" ^ plain get) ) ;
+                    first_goaway c ) )
+          in
+          equal Testable.bool true
+            (String.starts_with ~prefix:"GOAWAY 1 COMPRESSION_ERROR" r.value) ;
+          clean_end ~error_end:true r )
+    ; test "no ACK of our SETTINGS: GOAWAY SETTINGS_TIMEOUT at header_timeout"
+        (fun () ->
+          Sim_support.run (fun sim ->
+              raw_client sim ~config:timed (fun w r ->
+                  let t0 = Time.now Mono in
+                  Writer.write_string w Frame.preface ;
+                  Frame.write w (Settings {ack= false; settings= []}) ;
+                  Writer.flush w ;
+                  let goaway = read_goaway r in
+                  equal
+                    Testable.(pair string int64)
+                    ( {|GOAWAY 0 SETTINGS_TIMEOUT "no ACK of our SETTINGS in time"|}
+                    , Span.to_ns timed.header_timeout )
+                    (goaway, since t0) ) ) )
+    ; test "the earliest timer: the ACK timer before the header block timer"
+        (fun () ->
+          (* The ACK deadline is at 200 ms, the deadline of the block that
+             starts at 100 ms is at 300 ms. *)
+          Sim_support.run (fun sim ->
+              raw_client sim ~config:timed (fun w r ->
+                  let t0 = Time.now Mono in
+                  Writer.write_string w Frame.preface ;
+                  Frame.write w (Settings {ack= false; settings= []}) ;
+                  Writer.flush w ;
+                  Time.sleep Mono (Span.ms 100) ;
+                  Frame.write w
+                    (headers_frame ~end_stream:true ~end_headers:false 1
+                       (plain get) ) ;
+                  Writer.flush w ;
+                  let goaway = read_goaway r in
+                  equal
+                    Testable.(pair string int64)
+                    ( {|GOAWAY 1 SETTINGS_TIMEOUT "no ACK of our SETTINGS in time"|}
+                    , Span.to_ns timed.header_timeout )
+                    (goaway, since t0) ) ) )
+    ; test "a header block that starts late kicks the watchdog" (fun () ->
+          (* The watchdog waits for the idle deadline at 30 s. The block that
+             starts at 300 ms moves the deadline to 500 ms. *)
+          let r =
+            Sim_support.run (fun sim ->
+                serve
+                  ~config:{timed with idle_timeout= Span.s 30}
+                  sim hello
+                  (fun c ->
+                    let t0 = Time.now Mono in
+                    Time.sleep Mono (Span.ms 300) ;
+                    Fake.send c
+                      (headers_frame ~end_stream:true ~end_headers:false 1
+                         (plain get) ) ;
+                    let goaway = first_goaway c in
+                    (goaway, since t0) ) )
+          in
+          equal
+            Testable.(pair string int64)
+            ( {|GOAWAY 1 ENHANCE_YOUR_CALM "a header block that did not end in time"|}
+            , Span.to_ns (Span.ms 500) )
+            r.value ;
+          clean_end ~error_end:true ~block_open:true r )
+    ; test "a BDP client: a PING for each round trip of a large download"
+        (fun () ->
+          (* As gRPC clients: a PING when DATA comes and no PING is out, the
+             next one after its ACK. 160 MiB give more than 1000 PINGs. Each
+             DATA frame of the engine gives a PING token back. *)
+          let chunk = Bytes.make 65536 'b' in
+          let handler _ =
+            Response.stream (fun w ->
+                for _ = 1 to 160 * 16 do
+                  Body.Writer.write w chunk 0 65536
+                done )
+          in
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~settings:opened sim handler (fun c ->
+                    open_window c ;
+                    Fake.request c ~stream:1 get ;
+                    let pings = ref 0 and out = ref false and fin = ref false in
+                    while not !fin do
+                      match Fake.next c with
+                      | Data {data; end_stream; _} ->
+                          if data <> "" && not !out then begin
+                            Fake.send c (ping "bdp00000") ;
+                            out := true ;
+                            incr pings
+                          end ;
+                          if end_stream then fin := true
+                      | Ping {ack= true; _} ->
+                          out := false
+                      | Goaway _ as f ->
+                          failwith (brief f)
+                      | _ ->
+                          ()
+                    done ;
+                    !pings ) )
+          in
+          equal Testable.bool true (r.value > 1000) ;
+          clean_end r )
+    ; test "a gRPC-Go client with an RTT of 1 ms: PINGs for 320 MiB" (fun () ->
+          (* The rule of gRPC-Go: at most one BDP PING out, the next at the
+             first DATA after its ACK. Windows of 256 KiB with credit for each
+             frame, and the ACK comes 1 ms (one round trip) after the PING.
+             About one PING for each millisecond: with no tokens back, the
+             bucket ends the download after about 1.1 s and 291 MB. *)
+          let chunk = String.make (1024 * 1024) 'x' in
+          let window = 262144 in
+          let r =
+            Sim_support.run ~guard:(Span.s 60) (fun sim ->
+                serve
+                  ~settings:[(initial_window_size, window)]
+                  ~config:{config with write_timeout= Span.s 100}
+                  sim
+                  (fun _ ->
+                    Response.stream (fun w ->
+                        for _ = 1 to 320 do
+                          Body.Writer.write_string w chunk
+                        done ) )
+                  (fun c ->
+                    Fake.send c
+                      (Window_update {stream= 0; increment= window - 65535}) ;
+                    Fake.request c ~stream:1 get ;
+                    let out = ref false and pings = ref 0 and bytes = ref 0 in
+                    let rec loop () =
+                      match Fake.next c with
+                      | Data {stream= 1; data; end_stream; _} ->
+                          if data <> "" then
+                            Fake.credit c ~stream:1 (String.length data) ;
+                          bytes := !bytes + String.length data ;
+                          if not !out then begin
+                            out := true ;
+                            incr pings ;
+                            Fake.send c (ping "bdpbdpbd")
+                          end ;
+                          if not end_stream then loop ()
+                      | Ping {ack= true; _} ->
+                          Time.sleep Mono (Span.ms 1) ;
+                          out := false ;
+                          loop ()
+                      | Goaway _ as f ->
+                          failwith (brief f)
+                      | _ ->
+                          loop ()
+                    in
+                    loop () ;
+                    (!bytes, !pings > 1110) ) )
+          in
+          equal Testable.(pair int bool) (320 * 1024 * 1024, true) r.value ;
+          clean_end r )
+    ; test "1000 cancels at a normal rate: the budget refills in time"
+        (fun () ->
+          (* A client that cancels slow streams, one each 20 ms: 50 for each
+             second, less than the refill of 100. *)
+          let r =
+            Sim_support.run ~guard:(Span.s 60) (fun sim ->
+                serve sim
+                  (fun _ -> sync never)
+                  (fun c ->
+                    for i = 0 to 999 do
+                      let stream = (2 * i) + 1 in
+                      Fake.request c ~stream get ;
+                      Time.sleep Mono (Span.ms 20) ;
+                      Fake.reset c ~stream Cancel
+                    done ;
+                    Weft_sim.settle sim ;
+                    List.exists is_goaway (Fake.take_all c) ) )
+          in
+          equal Testable.bool false r.value ;
+          clean_end r )
+    ; test "a GOAWAY flood: one GOAWAY of ours, then the bucket ends it"
+        (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~h2:small sim
+                  (fun _ -> sync never)
+                  (fun c ->
+                    open_1 c ;
+                    Fake.send_all c (List.init 6 (fun _ -> goaway No_error)) ;
+                    let rec goaways acc =
+                      match Fake.next c with
+                      | Goaway {code= Enhance_your_calm; _} as f ->
+                          List.rev (brief f :: acc)
+                      | Goaway _ as f ->
+                          goaways (brief f :: acc)
+                      | _ ->
+                          goaways acc
+                    in
+                    goaways [] ) )
+          in
+          equal
+            Testable.(list string)
+            [ {|GOAWAY 1 NO_ERROR "the client sent GOAWAY"|}
+            ; {|GOAWAY 1 ENHANCE_YOUR_CALM "a flood of GOAWAY frames"|} ]
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "empty CONTINUATION frames take tokens" (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~h2:small sim hello (fun c ->
+                    Fake.send c
+                      (headers_frame ~end_stream:true ~end_headers:false 1
+                         (plain get) ) ;
+                    Fake.send_all c
+                      (List.init 6 (fun _ ->
+                           Frame.Continuation
+                             {stream= 1; end_headers= false; block= ""} ) ) ;
+                    first_goaway c ) )
+          in
+          equal Testable.string
+            {|GOAWAY 1 ENHANCE_YOUR_CALM "a flood of empty DATA or CONTINUATION frames"|}
+            r.value ;
+          clean_end ~error_end:true ~block_open:true r )
+    ; test "late RST_STREAM frames take tokens, a reset of an open stream not"
+        (fun () ->
+          (* Six resets of open streams after their heads (no cost of the reset
+             budget), then six RST_STREAM frames on a closed stream. *)
+          let handler _ =
+            Response.stream (fun w ->
+                Body.Writer.write_string w "a" ;
+                Body.Writer.flush w ;
+                sync never )
+          in
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~h2:small sim handler (fun c ->
+                    let rst stream = Frame.Rst_stream {stream; code= Cancel} in
+                    let ids = List.init 6 (fun i -> (2 * i) + 1) in
+                    List.iter
+                      (fun stream ->
+                        Fake.request c ~stream get ;
+                        ignore (Fake.frames_until c is_data) )
+                      ids ;
+                    Fake.send_all c (List.map rst ids) ;
+                    Weft_sim.settle sim ;
+                    let early = List.exists is_goaway (Fake.take_all c) in
+                    Fake.send_all c (List.init 6 (fun _ -> rst 1)) ;
+                    (early, first_goaway c) ) )
+          in
+          equal
+            Testable.(pair bool string)
+            ( false
+            , {|GOAWAY 11 ENHANCE_YOUR_CALM "a flood of late RST_STREAM frames"|}
+            )
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "the default reset budget is 2 * max_concurrent_streams" (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve
+                  ~h2:{Settings.default with max_concurrent_streams= 5}
+                  sim
+                  (fun _ -> sync never)
+                  (fun c ->
+                    (* The fiber of each reset ends before the next request: the
+                       engine refuses none. *)
+                    for i = 0 to 10 do
+                      Fake.request c ~stream:((2 * i) + 1) get ;
+                      Fake.reset c ~stream:((2 * i) + 1) Cancel ;
+                      Weft_sim.settle sim
+                    done ;
+                    first_goaway c ) )
+          in
+          equal Testable.string
+            {|GOAWAY 21 ENHANCE_YOUR_CALM "too many streams that end with no response"|}
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "refused streams cost the reset budget" (fun () ->
+          (* One stream is live; the next ones are refused. *)
+          let r =
+            Sim_support.run (fun sim ->
+                serve
+                  ~h2:
+                    { Settings.default with
+                      max_concurrent_streams= 1
+                    ; reset_budget= Some 3 }
+                  sim
+                  (fun _ -> sync never)
+                  (fun c ->
+                    Fake.request c ~stream:1 get ;
+                    Fake.send_all c
+                      (List.init 4 (fun i ->
+                           headers_frame ~end_stream:true
+                             ((2 * i) + 3)
+                             (plain get) ) ) ;
+                    first_goaway c ) )
+          in
+          equal Testable.string
+            {|GOAWAY 9 ENHANCE_YOUR_CALM "too many streams that end with no response"|}
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "a malformed request costs the budget, an early 417 does not"
+        (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~h2:{Settings.default with reset_budget= Some 0} sim hello
+                  (fun c ->
+                    Fake.request c ~stream:1
+                      (request ~fields:[("expect", "foo")] ()) ;
+                    let early = show_response (Fake.response c ~stream:1) in
+                    Fake.request c ~stream:3 get ;
+                    let body = (Fake.response c ~stream:3).body in
+                    (* A pseudo field after a regular field. *)
+                    Fake.request c ~stream:5 (("x-a", "1") :: get) ;
+                    (early, body, first_goaway c) ) )
+          in
+          equal
+            Testable.(triple string string string)
+            ( "head :status=417 content-length=0"
+            , "hello"
+            , {|GOAWAY 5 ENHANCE_YOUR_CALM "too many streams that end with no response"|}
+            )
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "the refund of a response stops at the budget" (fun () ->
+          (* Five responses give back one token at most. *)
+          let handler = paths [("/", hello); ("/wait", fun _ -> sync never)] in
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~h2:{Settings.default with reset_budget= Some 1}
+                  sim handler (fun c ->
+                    for i = 0 to 4 do
+                      Fake.request c ~stream:((2 * i) + 1) get ;
+                      ignore (Fake.response c ~stream:((2 * i) + 1))
+                    done ;
+                    Fake.request c ~stream:11 (request ~path:"/wait" ()) ;
+                    Fake.reset c ~stream:11 Cancel ;
+                    Fake.request c ~stream:13 (request ~path:"/wait" ()) ;
+                    Fake.reset c ~stream:13 Cancel ;
+                    first_goaway c ) )
+          in
+          equal Testable.string
+            {|GOAWAY 13 ENHANCE_YOUR_CALM "too many streams that end with no response"|}
+            r.value ;
+          clean_end ~error_end:true r )
+    ; test "no ACK timer after the end of the input" (fun () ->
+          (* The client never sends the ACK, and ends its stream after a
+             request. The response takes 300 ms, longer than header_timeout. *)
+          let handler req =
+            Time.sleep Mono (Span.ms 300) ;
+            hello req
+          in
+          Sim_support.run (fun sim ->
+              Sim_support.with_pair sim (fun client server ->
+                  Fiber.scope (fun s ->
+                      let flow = Tcp.flow client in
+                      let engine =
+                        Sim_support.call s (fun () ->
+                            H2_server.serve
+                              (ctx {timed with cancel_on_disconnect= false})
+                              (Tcp.flow server) handler )
+                      in
+                      let w = Writer.create flow and r = Reader.create flow in
+                      Writer.write_string w Frame.preface ;
+                      Frame.write w (Settings {ack= false; settings= []}) ;
+                      Frame.write w
+                        (headers_frame ~end_stream:true 1 (plain get)) ;
+                      Writer.flush w ;
+                      Flow.shutdown_send flow ;
+                      let rec frames acc =
+                        match Frame.read r ~max_size:16384 with
+                        | f ->
+                            frames (brief f :: acc)
+                        | exception (End_of_file | Flow.Closed) ->
+                            List.rev acc
+                      in
+                      let got = frames [] in
+                      Sim_support.await engine ;
+                      equal Testable.bool true (List.mem "DATA 1 5" got) ;
+                      equal Testable.bool false
+                        (List.exists
+                           (fun f -> String.starts_with ~prefix:"GOAWAY" f)
+                           got ) ) ) ) )
+    ; test
+        "streams with no window leave the round of W, a credit puts them back"
+        (fun () ->
+          (* 99 streams with a stream window of 0 wait for credit. One stream
+             with credit sends 1 MiB: W visits it for each part, and visits each
+             waiting stream only one time. Then a credit for each waiting stream
+             puts it back. *)
+          let handler req =
+            if Request.path req = "/big" then
+              Response.string (String.make (1024 * 1024) 'b')
+            else Response.string (String.make 1024 's')
+          in
+          let r =
+            Sim_support.run (fun sim ->
+                serve_with
+                  ~config:{config with write_timeout= Span.s 10}
+                  ~settings:[(initial_window_size, 0)]
+                  sim handler
+                  (fun c e ->
+                    open_window c ;
+                    let waiting = List.init 99 (fun i -> (2 * i) + 1) in
+                    let start = e.probe.visits () in
+                    List.iter (fun stream -> Fake.request c ~stream get) waiting ;
+                    Weft_sim.settle sim ;
+                    let parked = e.probe.parked () in
+                    (* One visit of each stream: its head, then it parks. *)
+                    let setup = e.probe.visits () - start in
+                    let before = e.probe.visits () in
+                    Fake.request c ~stream:199 (request ~path:"/big" ()) ;
+                    Fake.send c
+                      (Window_update {stream= 199; increment= 0x7fff_ffff}) ;
+                    let big = (Fake.response c ~stream:199).body in
+                    let visits = e.probe.visits () - before in
+                    List.iter
+                      (fun stream ->
+                        Fake.send c (Window_update {stream; increment= 1024}) )
+                      waiting ;
+                    let small =
+                      List.for_all
+                        (fun stream ->
+                          String.length (Fake.response c ~stream).body = 1024 )
+                        waiting
+                    in
+                    ( (parked, setup)
+                    , String.length big
+                    , (* 64 parts of 16 KiB, and a few more visits. *)
+                      visits >= 64 && visits < 200
+                    , small ) ) )
+          in
+          equal
+            Testable.(pair (pair int int) (triple int bool bool))
+            ((99, 99), (1024 * 1024, true, true))
+            (let a, b, v, sm = r.value in
+             (a, (b, v, sm)) ) ;
+          clean_end r )
+    ; test "a larger initial window of the client puts the waiting streams back"
+        (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve
+                  ~config:{config with write_timeout= Span.s 10}
+                  ~settings:[(initial_window_size, 0)]
+                  sim
+                  (fun _ -> Response.string (String.make 1024 's'))
+                  (fun c ->
+                    let ids = [1; 3; 5] in
+                    List.iter (fun stream -> Fake.request c ~stream get) ids ;
+                    Weft_sim.settle sim ;
+                    Fake.send c
+                      (Settings
+                         {ack= false; settings= [(initial_window_size, 65535)]}
+                      ) ;
+                    List.map
+                      (fun stream ->
+                        String.length (Fake.response c ~stream).body )
+                      ids ) )
+          in
+          equal Testable.(list int) [1024; 1024; 1024] r.value ;
+          clean_end r )
+    ; test "no connection window: the stream stays in the round" (fun () ->
+          (* Stream 1 takes the connection window. Stream 3 has a stream window
+             of 1 (the initial window of the client) and no connection window:
+             it does not leave the round, and a credit of the connection alone
+             makes it send its byte. *)
+          let handler =
+            paths
+              [ ("/big", fun _ -> Response.string (String.make 70000 'b'))
+              ; ("/small", fun _ -> Response.string "s") ]
+          in
+          let r =
+            Sim_support.run (fun sim ->
+                serve_with
+                  ~config:{config with write_timeout= Span.s 10}
+                  ~settings:[(initial_window_size, 1)]
+                  sim handler
+                  (fun c e ->
+                    Fake.request c ~stream:1 (request ~path:"/big" ()) ;
+                    Fake.send c (Window_update {stream= 1; increment= 100_000}) ;
+                    let rec drain got =
+                      if got < 65535 then
+                        match Fake.next c with
+                        | Data {stream= 1; data; _} ->
+                            drain (got + String.length data)
+                        | _ ->
+                            drain got
+                    in
+                    drain 0 ;
+                    Fake.request c ~stream:3 (request ~path:"/small" ()) ;
+                    Weft_sim.settle sim ;
+                    let parked = e.probe.parked () in
+                    Fake.send c (Window_update {stream= 0; increment= 10_000}) ;
+                    let body = (Fake.response c ~stream:3).body in
+                    ignore (Fake.response c ~stream:1) ;
+                    (parked, body) ) )
+          in
+          equal Testable.(pair int string) (0, "s") r.value ;
+          clean_end r )
+    ; test "a stream credit with no connection window: back in the round"
+        (fun () ->
+          (* Stream 1 takes the connection window. Stream 3 parks with a stream
+             window of 0. A credit of the stream puts it back, and it stays in
+             the round with no connection window. A credit of the connection
+             then makes it send. *)
+          let handler =
+            paths
+              [ ("/big", fun _ -> Response.string (String.make 70000 'b'))
+              ; ("/small", fun _ -> Response.string "s") ]
+          in
+          let r =
+            Sim_support.run (fun sim ->
+                serve_with
+                  ~config:{config with write_timeout= Span.s 10}
+                  ~settings:[(initial_window_size, 0)]
+                  sim handler
+                  (fun c e ->
+                    Fake.request c ~stream:1 (request ~path:"/big" ()) ;
+                    Fake.send c (Window_update {stream= 1; increment= 100_000}) ;
+                    let rec drain got =
+                      if got < 65535 then
+                        match Fake.next c with
+                        | Data {stream= 1; data; _} ->
+                            drain (got + String.length data)
+                        | _ ->
+                            drain got
+                    in
+                    drain 0 ;
+                    Fake.request c ~stream:3 (request ~path:"/small" ()) ;
+                    Weft_sim.settle sim ;
+                    let parked = e.probe.parked () in
+                    Fake.send c (Window_update {stream= 3; increment= 1}) ;
+                    Weft_sim.settle sim ;
+                    let back = e.probe.parked () in
+                    Fake.send c (Window_update {stream= 0; increment= 10_000}) ;
+                    let body = (Fake.response c ~stream:3).body in
+                    ignore (Fake.response c ~stream:1) ;
+                    (parked, back, body) ) )
+          in
+          equal Testable.(triple int int string) (1, 0, "s") r.value ;
+          clean_end r )
+    ; test "a credit that leaves the stream window at 0 does not put it back"
+        (fun () ->
+          (* The stream sends 1000 bytes and parks. A SETTINGS frame makes its
+             window -1000, and a credit of 1000 makes it 0: the stream stays
+             parked (W does not visit it). A credit of 500 more sends 500. *)
+          let r =
+            Sim_support.run (fun sim ->
+                serve_with
+                  ~config:{config with write_timeout= Span.s 10}
+                  ~settings:[(initial_window_size, 1000)]
+                  sim
+                  (fun _ -> Response.string (String.make 2000 's'))
+                  (fun c e ->
+                    Fake.request c ~stream:1 get ;
+                    ignore (Fake.frames_until c is_data) ;
+                    Weft_sim.settle sim ;
+                    Fake.send c
+                      (Settings
+                         {ack= false; settings= [(initial_window_size, 0)]} ) ;
+                    Weft_sim.settle sim ;
+                    let before = e.probe.visits () in
+                    Fake.send c (Window_update {stream= 1; increment= 1000}) ;
+                    Weft_sim.settle sim ;
+                    let visits = e.probe.visits () - before in
+                    Fake.send c (Window_update {stream= 1; increment= 500}) ;
+                    let next =
+                      match List.rev (Fake.frames_until c is_data) with
+                      | Data {data; _} :: _ ->
+                          String.length data
+                      | _ ->
+                          -1
+                    in
+                    Fake.send c (Window_update {stream= 1; increment= 1000}) ;
+                    ignore (Fake.response c ~stream:1) ;
+                    (visits, next) ) )
+          in
+          equal Testable.(pair int int) (0, 500) r.value ;
+          clean_end r )
+    ; test "a SETTINGS frame puts back only the streams with a window"
+        (fun () ->
+          (* The streams wait with a window of 0. A SETTINGS frame with the same
+             initial window puts none back (W visits none). An initial window of
+             1 puts each back: a DATA frame of 1 byte. *)
+          let r =
+            Sim_support.run (fun sim ->
+                serve_with
+                  ~config:{config with write_timeout= Span.s 10}
+                  ~settings:[(initial_window_size, 0)]
+                  sim
+                  (fun _ -> Response.string (String.make 1024 's'))
+                  (fun c e ->
+                    let ids = [1; 3; 5] in
+                    List.iter (fun stream -> Fake.request c ~stream get) ids ;
+                    Weft_sim.settle sim ;
+                    let before = e.probe.visits () in
+                    Fake.send c
+                      (Settings
+                         {ack= false; settings= [(initial_window_size, 0)]} ) ;
+                    Weft_sim.settle sim ;
+                    let same = e.probe.visits () - before in
+                    Fake.send c
+                      (Settings
+                         {ack= false; settings= [(initial_window_size, 1)]} ) ;
+                    (* Three DATA frames of 1 byte, in any order. *)
+                    let ones =
+                      List.init 3 (fun _ ->
+                          match List.rev (Fake.frames_until c is_data) with
+                          | Data {stream; data; _} :: _ ->
+                              (stream, String.length data)
+                          | _ ->
+                              (0, -1) )
+                      |> List.sort compare |> List.map snd
+                    in
+                    Fake.send c
+                      (Settings
+                         {ack= false; settings= [(initial_window_size, 65535)]}
+                      ) ;
+                    let rest =
+                      List.map
+                        (fun stream ->
+                          String.length (Fake.response c ~stream).body )
+                        ids
+                    in
+                    (same, ones, rest) ) )
+          in
+          equal
+            Testable.(triple int (list int) (list int))
+            (0, [1; 1; 1], [1023; 1023; 1023])
+            r.value ;
+          clean_end r )
+    ; test "a navigation: 100 resets and 120 requests in one write" (fun () ->
+          (* The cancelled fibers did not end when the new requests come: the
+             engine refuses some of them by its count of live fibers. These
+             refusals cost no reset budget. *)
+          let handler = paths [("/slow", fun _ -> sync never); ("/", hello)] in
+          let r =
+            Sim_support.run (fun sim ->
+                serve sim handler (fun c ->
+                    for i = 0 to 99 do
+                      Fake.request c
+                        ~stream:((2 * i) + 1)
+                        (request ~path:"/slow" ())
+                    done ;
+                    Weft_sim.settle sim ;
+                    Fake.send_all c
+                      ( List.init 100 (fun i ->
+                            Frame.Rst_stream {stream= (2 * i) + 1; code= Cancel} )
+                      @ List.init 120 (fun i ->
+                          headers_frame ~end_stream:true
+                            (201 + (2 * i))
+                            (plain get) ) ) ;
+                    Weft_sim.settle sim ;
+                    let frames = Fake.take_all c in
+                    ( List.exists
+                        (function
+                          | Frame.Rst_stream {code= Refused_stream; _} ->
+                              true
+                          | _ ->
+                              false )
+                        frames
+                    , List.exists is_goaway frames ) ) )
+          in
+          equal Testable.(pair bool bool) (true, false) r.value ;
+          clean_end r )
+    ; test "two writers of one stream wait for a flush" (fun () ->
+          (* The client stops to read, thus W waits in a write of the 200 KiB of
+             the main fiber. Then the two fibers of the producer wait for a
+             flush at the same time. The first one that returns (the main fiber,
+             which waits first) writes 200 KiB again: then the other one waits
+             for that write too, and the next flush must wake it. *)
+          let big = String.make (200 * 1024) 'b' in
+          let handler _ =
+            Response.stream (fun w ->
+                Fiber.scope (fun s ->
+                    Fiber.fork s (fun () ->
+                        Body.Writer.write_string w "a" ;
+                        Body.Writer.flush w ) ;
+                    Body.Writer.write_string w big ;
+                    Body.Writer.flush w ;
+                    Body.Writer.write_string w big ) )
+          in
+          let r =
+            Sim_support.run (fun sim ->
+                serve sim handler (fun c ->
+                    open_window c ;
+                    Fake.send c
+                      (Settings
+                         { ack= false
+                         ; settings= [(initial_window_size, 0x7fff_ffff)] } ) ;
+                    Fake.pause_reading c ;
+                    Fake.request c ~stream:1 get ;
+                    Weft_sim.settle sim ;
+                    Fake.resume_reading c ;
+                    String.length (Fake.response c ~stream:1).body ) )
+          in
+          equal Testable.int ((400 * 1024) + 1) r.value ;
+          clean_end r )
+    ; test "a client reset of a parked stream leaves no parked entry" (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve
+                  ~config:{config with write_timeout= Span.s 10}
+                  ~settings:[(initial_window_size, 0)]
+                  sim
+                  (fun _ -> Response.string "s")
+                  (fun c ->
+                    Fake.request c ~stream:1 get ;
+                    Weft_sim.settle sim ;
+                    Fake.reset c ~stream:1 Cancel ;
+                    Weft_sim.settle sim ) )
+          in
+          clean_end r )
+    ; test "browser-like traffic trips no limit" (fun () ->
+          (* At the start: a connection window, 5 PRIORITY frames for a tree on
+             idle streams, and 30 PINGs. Then 300 requests in batches of 50,
+             each with a PRIORITY frame and a PRIORITY_UPDATE frame (type 0x10,
+             unknown to the engine). The client gives credit for each DATA
+             frame: more than 1000 WINDOW_UPDATE frames, at the edge of the rule
+             (2 for each DATA frame). One request of each batch is reset before
+             its response. No virtual time passes: the test checks the tokens,
+             not the refill. *)
+          let body = String.make 20000 'b' in
+          let r =
+            Sim_support.run (fun sim ->
+                serve sim
+                  (fun _ -> Response.string body)
+                  (fun c ->
+                    open_window c ;
+                    Fake.send_all c
+                      (List.init 5 (fun i -> priority ((2 * i) + 3))) ;
+                    Fake.send_all c (List.init 30 (fun _ -> ping "12345678")) ;
+                    let updates = ref 0 and bodies = ref 0 in
+                    for batch = 0 to 5 do
+                      (* The streams start at 13, after the PRIORITY tree on 3
+                         to 11. *)
+                      let ids =
+                        List.init 50 (fun i -> 13 + (2 * ((50 * batch) + i)))
+                      in
+                      let reset = List.hd ids in
+                      List.iter
+                        (fun id ->
+                          Fake.request c ~stream:id get ;
+                          Fake.send c (priority id) ;
+                          Fake.send_raw c
+                            (H2_support.raw ~kind:0x10 ~stream:0
+                               ("\000\000\000\001" ^ "u=3") ) ;
+                          if id = reset then Fake.reset c ~stream:id Cancel )
+                        ids ;
+                      let pending = ref (List.length ids - 1) in
+                      while !pending > 0 do
+                        match Fake.next c with
+                        | Data {stream; data; end_stream; _}
+                          when stream <> reset ->
+                            if data <> "" then begin
+                              Fake.credit c ~stream (String.length data) ;
+                              updates := !updates + 2
+                            end ;
+                            if end_stream then begin
+                              decr pending ; incr bodies
+                            end
+                        | Goaway _ as f ->
+                            failwith (brief f)
+                        | _ ->
+                            ()
+                      done
+                    done ;
+                    Weft_sim.settle sim ;
+                    ( !bodies
+                    , !updates > 1000
+                    , List.exists is_goaway (Fake.take_all c) ) ) )
+          in
+          (* 6 batches of 49 responses: one stream of each batch was reset. *)
+          equal Testable.(triple int bool bool) (6 * 49, true, false) r.value ;
+          clean_end r ) ]
+
 let () =
   exit
     (Windtrap.run "h2_engine"
-       [fake_client_tests; engine_tests; rule_tests; lifecycle_tests] )
+       [ fake_client_tests
+       ; engine_tests
+       ; rule_tests
+       ; lifecycle_tests
+       ; limits_tests ] )

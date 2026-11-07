@@ -185,6 +185,10 @@ val send_window : t -> stream:int -> int
     stream send window. It is negative if a SETTINGS frame made the stream
     window negative. It is [0] for a stream that the state does not know. *)
 
+val stream_window : t -> stream:int -> int
+(** [stream_window t ~stream] is the stream send window of [stream] alone. It is
+    [0] for a stream that the state does not know. *)
+
 val sent : t -> stream:int -> int -> unit
 (** [sent t ~stream n] records that the server sent [n] bytes of DATA on
     [stream]. *)

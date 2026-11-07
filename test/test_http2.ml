@@ -2976,7 +2976,205 @@ let message_tests =
           | Error _ ->
               () ) ]
 
+(* {1 The limits} *)
+
+module Limits = Caravan_http2.Private.Limits
+module Bucket = Limits.Bucket
+module Settings = Caravan_http2.Settings
+
+let second = 1_000_000_000
+
+let limits_tests =
+  group "Limits"
+    [ test "the class of each frame" (fun () ->
+          let cls f =
+            match Limits.class_of f with Some k -> Limits.name k | None -> "-"
+          in
+          equal
+            Testable.(list string)
+            [ "SETTINGS"
+            ; "SETTINGS"
+            ; "PING"
+            ; "PING"
+            ; "empty DATA or CONTINUATION"
+            ; "-"
+            ; "-"
+            ; "-"
+            ; "PRIORITY"
+            ; "PRIORITY"
+            ; "WINDOW_UPDATE"
+            ; "unknown"
+            ; "empty DATA or CONTINUATION"
+            ; "-"
+            ; "-"
+            ; "-"
+            ; "GOAWAY" ]
+            (List.map cls
+               [ Frame.Settings {ack= false; settings= []}
+               ; Settings {ack= true; settings= []}
+               ; Ping {ack= false; data= "12345678"}
+               ; Ping {ack= true; data= "12345678"}
+               ; Data {stream= 1; end_stream= false; data= ""; flow_length= 0}
+               ; Data {stream= 1; end_stream= true; data= ""; flow_length= 0}
+               ; Data {stream= 1; end_stream= false; data= "x"; flow_length= 1}
+               ; Headers
+                   { stream= 1
+                   ; end_stream= false
+                   ; end_headers= true
+                   ; priority= None
+                   ; block= "" }
+               ; Priority
+                   { stream= 1
+                   ; priority= {exclusive= false; dependency= 0; weight= 15} }
+               ; Malformed {stream= 1; code= Error.Frame_size_error; reason= ""}
+               ; Window_update {stream= 0; increment= 1}
+               ; Unknown {kind= 0xfa; stream= 0}
+               ; Continuation {stream= 1; end_headers= false; block= ""}
+               ; Continuation {stream= 1; end_headers= true; block= "x"}
+               ; Rst_stream {stream= 1; code= Error.Cancel}
+               ; Push_promise {stream= 1}
+               ; Goaway {last_stream= 0; code= Error.No_error; debug= ""} ] ) ;
+          equal Testable.string "late RST_STREAM" (Limits.name Closed_reset) )
+    ; test "a bucket: take, refill when empty, give, and the caps" (fun () ->
+          let b = Bucket.create ~tokens:3 ~refill:2 in
+          let clock = ref 0 in
+          let take () = Bucket.take b ~now:(fun () -> !clock) in
+          (* The takes in order (a list literal evaluates from the right). *)
+          let takes n = List.init n (fun _ -> take ()) in
+          equal Testable.(list bool) [true; true; true; false] (takes 4) ;
+          (* Half a second gives 1 token at 2 tokens for each second. *)
+          clock := second / 2 ;
+          equal Testable.(list bool) [true; false] (takes 2) ;
+          (* A long time fills the bucket to its size, not more. *)
+          clock := 100 * second ;
+          equal Testable.(list bool) [true; true; true; false] (takes 4) ;
+          Bucket.give b 5 ;
+          equal Testable.int 3 (Bucket.count b) ;
+          (* 1 token for each second. *)
+          let b = Bucket.create ~tokens:1 ~refill:1 in
+          let at t = Bucket.take b ~now:(fun () -> t) in
+          let first = at 0 in
+          let half = at (second / 2) in
+          let later = at second in
+          equal Testable.(list bool) [true; false; true] [first; half; later] ;
+          (* No refill. *)
+          let b = Bucket.create ~tokens:1 ~refill:0 in
+          let first = Bucket.take b ~now:(fun () -> second) in
+          let later = Bucket.take b ~now:(fun () -> 9 * second) in
+          equal Testable.(pair bool bool) (true, false) (first, later) )
+    ; test "a bucket reads the clock only when it is empty" (fun () ->
+          let reads = ref 0 in
+          let now () = incr reads ; 0 in
+          let b = Bucket.create ~tokens:2 ~refill:1 in
+          ignore (Bucket.take b ~now) ;
+          ignore (Bucket.take b ~now) ;
+          equal Testable.int 0 !reads ;
+          ignore (Bucket.take b ~now) ;
+          equal Testable.int 1 !reads )
+    ; test "a bucket loses no part of a token" (fun () ->
+          (* 10 tokens for each second: a take every 60 ms finds 6 tokens in 600
+             ms, not 0. *)
+          let b = Bucket.create ~tokens:10 ~refill:10 in
+          for _ = 1 to 10 do
+            ignore (Bucket.take b ~now:(fun () -> 0))
+          done ;
+          let got = ref 0 in
+          for i = 1 to 10 do
+            if Bucket.take b ~now:(fun () -> i * 60_000_000) then incr got
+          done ;
+          equal Testable.int 6 !got )
+    ; test "a bucket with the largest refill after a long time: no overflow"
+        (fun () ->
+          (* 1_000_000 tokens for each second, after 30 days. *)
+          let b = Bucket.create ~tokens:1_000_000 ~refill:1_000_000 in
+          for _ = 1 to 1_000_000 do
+            ignore (Bucket.take b ~now:(fun () -> 0))
+          done ;
+          equal Testable.int 0 (Bucket.count b) ;
+          equal Testable.bool true
+            (Bucket.take b ~now:(fun () -> 30 * 86400 * second)) ;
+          equal Testable.int 999_999 (Bucket.count b) )
+    ; test "Limits.t: one bucket for each class" (fun () ->
+          let t = Limits.create ~tokens:2 ~refill:0 in
+          let now () = 0 in
+          let classes =
+            Limits.
+              [ Settings_frame
+              ; Ping_frame
+              ; Empty_frame
+              ; Priority_frame
+              ; Window_update_frame
+              ; Unknown_frame
+              ; Goaway_frame
+              ; Closed_reset ]
+          in
+          List.iter (fun k -> ignore (Limits.take t k ~now)) classes ;
+          Limits.give t Ping_frame 1 ;
+          equal
+            Testable.(list int)
+            [1; 2; 1; 1; 1; 1; 1; 1]
+            (List.map (Limits.count t) classes) )
+    ; test "Settings.validate" (fun () ->
+          let s = Settings.default in
+          Settings.validate s ;
+          let top =
+            { Settings.max_concurrent_streams= 0xffff_ffff
+            ; initial_window= 0x7fff_ffff
+            ; header_table_size= 0xffff_ffff
+            ; max_header_list_size= Some 0xffff_ffff
+            ; reset_budget= Some 1_000_000
+            ; frame_tokens= 1_000_000
+            ; frame_refill= 1_000_000
+            ; control_queue= 1_000_000 }
+          in
+          Settings.validate top ;
+          Settings.validate
+            { s with
+              max_concurrent_streams= 1
+            ; header_table_size= 0
+            ; reset_budget= Some 0
+            ; frame_tokens= 1
+            ; frame_refill= 0
+            ; control_queue= 1
+            ; max_header_list_size= Some 0 } ;
+          List.iter
+            (fun (s, text) ->
+              raises
+                (Invalid_argument ("Caravan_http2.Settings: " ^ text))
+                (fun () -> Settings.validate s) )
+            [ ({s with max_concurrent_streams= 0}, "max_concurrent_streams 0")
+            ; ( {s with max_concurrent_streams= 0x1_0000_0000}
+              , "max_concurrent_streams 4294967296" )
+            ; ({s with initial_window= 65534}, "initial_window 65534")
+            ; ({s with initial_window= 0x8000_0000}, "initial_window 2147483648")
+            ; ({s with header_table_size= -1}, "header_table_size -1")
+            ; ( {s with header_table_size= 0x1_0000_0000}
+              , "header_table_size 4294967296" )
+            ; ( {s with max_header_list_size= Some (-1)}
+              , "max_header_list_size -1" )
+            ; ( {s with max_header_list_size= Some 0x1_0000_0000}
+              , "max_header_list_size 4294967296" )
+            ; ({s with reset_budget= Some (-1)}, "reset_budget -1")
+            ; ({s with reset_budget= Some 1_000_001}, "reset_budget 1000001")
+            ; ({s with frame_tokens= 0}, "frame_tokens 0")
+            ; ({s with frame_tokens= 1_000_001}, "frame_tokens 1000001")
+            ; ({s with frame_refill= -1}, "frame_refill -1")
+            ; ({s with frame_refill= 1_000_001}, "frame_refill 1000001")
+            ; ({s with control_queue= 0}, "control_queue 0")
+            ; ({s with control_queue= 1_000_001}, "control_queue 1000001") ] ;
+          equal
+            Testable.(list int)
+            [100; 65535; 4096; 1000; 100; 1000]
+            [ s.max_concurrent_streams
+            ; s.initial_window
+            ; s.header_table_size
+            ; s.frame_tokens
+            ; s.frame_refill
+            ; s.control_queue ] ;
+          equal Testable.bool true
+            (s.max_header_list_size = None && s.reset_budget = None) ) ]
+
 let () =
   exit
     (Windtrap.run "http2"
-       [error_tests; frame_tests; conn_state_tests; message_tests] )
+       [error_tests; frame_tests; conn_state_tests; message_tests; limits_tests] )
