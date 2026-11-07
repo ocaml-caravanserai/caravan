@@ -32,7 +32,7 @@ let write_error exn bt =
 
 let default =
   { addr= Net.Tcp ("127.0.0.1", 8080)
-  ; backlog= 1024
+  ; backlog= 4096
   ; max_connections= 1024
   ; buffer_size= 4096
   ; max_request_line= 8192

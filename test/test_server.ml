@@ -27,7 +27,9 @@ let eof r = is_true ~msg:"the end of the stream" (is_eof r)
 
 let integration_tests =
   group "Server over sockets"
-    [ test "a burst of pipelined requests in one write" (fun () ->
+    [ test "the default backlog is 4096" (fun () ->
+          equal int 4096 Config.default.backlog )
+    ; test "a burst of pipelined requests in one write" (fun () ->
           Sim_support.run
           @@ fun _ ->
           with_server ~engine:h1

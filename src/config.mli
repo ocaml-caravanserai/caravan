@@ -9,7 +9,13 @@
 type t =
   { addr: Weft.Net.addr
         (** The address to listen on. Port [0] selects a free port. *)
-  ; backlog: int  (** The length of the queue of pending connections. *)
+  ; backlog: int
+        (** The length of the queue of pending connections. When the queue is
+            full, the OS drops new connections, and each client waits for a
+            retransmit of its SYN (1 s on Linux). The system can cap the value
+            with no error: Linux uses at most [net.core.somaxconn] (4096 by
+            default since Linux 5.4, 128 before), and macOS at most
+            [kern.ipc.somaxconn] (128 by default). *)
   ; max_connections: int
         (** The connections that the server serves at the same time, 1 or more.
             More connections wait in the queue. [Server.start] raises
@@ -77,7 +83,8 @@ type t =
             for example a broken pipe. *) }
 
 val default : t
-(** [default] listens on [127.0.0.1:8080] with a backlog of 1024 and at most
+(** [default] listens on [127.0.0.1:8080] with a backlog of 4096 (up to 4096
+    connections wait in the queue, if the system limit permits it) and at most
     1024 connections. It has 4 KiB buffers, the default limits (8 KiB request
     line, 16 KiB and 100 header fields), 8 MiB bodies and 64 KiB drains. Its
     timeouts are 10 s (head) and 30 s (idle, read, write), with 2 s of linger
