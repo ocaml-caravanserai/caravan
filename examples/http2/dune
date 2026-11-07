@@ -1,0 +1,42 @@
+(library
+ (name example_http2)
+ (modules app)
+ (libraries caravan weft))
+
+(executable
+ (name main)
+ (modules main)
+ (libraries
+  example_http2
+  example_dev
+  example_common
+  caravan
+  caravan.http2
+  caravan.tls
+  ptime
+  mirage-crypto-rng.unix
+  unix))
+
+; The test serves the application over TLS with a development certificate.
+; caravan has no HTTP/2 client: the HTTP/2 requests use the fake client of the
+; tests of caravan.
+
+(test
+ (name test)
+ (modules test)
+ (libraries
+  example_http2
+  example_dev
+  caravan
+  caravan.client
+  caravan.http2
+  caravan.tls
+  caravan.testing
+  fake_h2_client
+  tls
+  domain-name
+  ptime
+  mirage-crypto-rng
+  weft
+  weft.sim
+  windtrap))

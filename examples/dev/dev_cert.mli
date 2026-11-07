@@ -32,6 +32,8 @@ val write_ca : t -> string -> unit
 (** [write_ca t path] writes the certificate of the CA of [t] to the file
     [path], in PEM. It replaces the file. It writes no key. *)
 
-val server_config : t -> Tls.Config.server
-(** [server_config t] is a TLS configuration of a server with the server
-    certificate of [t], its key, and the ALPN protocol ["http/1.1"]. *)
+val server_config : ?alpn:string list -> t -> Tls.Config.server
+(** [server_config ~alpn t] is a TLS configuration of a server with the server
+    certificate of [t], its key, and the ALPN list [alpn] (default
+    [["http/1.1"]]). For HTTP/2 also, give [["h2"; "http/1.1"]] and the engine
+    [Caravan_http2.auto]. *)

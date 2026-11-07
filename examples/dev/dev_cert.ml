@@ -81,8 +81,8 @@ let write_ca t path =
   Out_channel.with_open_bin path (fun oc ->
       Out_channel.output_string oc (X509.Certificate.encode_pem t.ca) )
 
-let server_config t =
+let server_config ?(alpn = ["http/1.1"]) t =
   ok
     (Tls.Config.server
        ~certificates:(`Single ([t.leaf], t.key))
-       ~alpn_protocols:["http/1.1"] () )
+       ~alpn_protocols:alpn () )
