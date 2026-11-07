@@ -203,6 +203,8 @@
               utop
               ocamlformat
               odoc
+              # make h2spec: the conformance suite of HTTP/2.
+              pkgs.h2spec
             ];
           };
         }

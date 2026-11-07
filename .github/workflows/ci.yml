@@ -35,6 +35,10 @@ jobs:
         run: nix develop -c dune build @fmt
       - name: Test
         run: nix develop -c dune runtest --force
+      # The server of h2spec uses the Linux backend of weft.
+      - name: h2spec
+        if: runner.os == 'Linux'
+        run: nix develop -c make h2spec
 
   # The package of the flake: the libraries with no tests, as a user gets them.
   package:
