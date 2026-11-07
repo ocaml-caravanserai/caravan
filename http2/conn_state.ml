@@ -584,6 +584,13 @@ let send_window t ~stream =
   | None ->
       0
 
+let stream_window t ~stream =
+  match Hashtbl.find_opt t.streams stream with
+  | Some s ->
+      s.send_window
+  | None ->
+      0
+
 let sent t ~stream n =
   t.conn_send <- t.conn_send - n ;
   match Hashtbl.find_opt t.streams stream with

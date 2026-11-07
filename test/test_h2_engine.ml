@@ -10,6 +10,7 @@ module Tcp = Caravan.Tcp
 module Reader = Weft_flow.Reader
 module Writer = Weft_flow.Writer
 module Fake = Fake_h2_client
+module Settings = Caravan_http2.Settings
 
 let show = H2_support.show
 
@@ -522,14 +523,14 @@ type engine =
   ; abort: unit -> unit (* the server cancels the connection *)
   ; probe: H2_server.probe }
 
-(* [serve_with ~local ~config ~settings ~wrap ~stop ~hooks sim handler f] runs
-   the engine with [handler] on a TCP pair, and [f c e] with a fake client [c]
-   connected with [settings] and the engine [e]. The engine gets the flow [wrap
-   flow], the stop [stop] and the hooks [hooks] (with its own [inspect]). After
-   [f], the client ends its stream, and the engine must return or be cancelled.
-   The server side ends its stream at the end of the engine, also after a
-   cancel. *)
-let serve_with ?local ?(config = config) ?settings ?(wrap = Fun.id) ?stop
+(* [serve_with ~h2 ~config ~settings ~wrap ~stop ~hooks sim handler f] runs the
+   engine with the settings [h2] and [handler] on a TCP pair, and [f c e] with a
+   fake client [c] connected with [settings] and the engine [e]. The engine gets
+   the flow [wrap flow], the stop [stop] and the hooks [hooks] (with its own
+   [inspect]). After [f], the client ends its stream, and the engine must return
+   or be cancelled. The server side ends its stream at the end of the engine,
+   also after a cancel. *)
+let serve_with ?h2 ?(config = config) ?settings ?(wrap = Fun.id) ?stop
     ?(hooks = H2_server.no_hooks) sim handler f =
   let reports = ref [] and probe = ref None in
   let config =
@@ -546,7 +547,7 @@ let serve_with ?local ?(config = config) ?settings ?(wrap = Fun.id) ?stop
                     Fiber.shield (fun () ->
                         try Flow.shutdown_send flow with Flow.Closed -> () ) )
                   (fun () ->
-                    H2_server.serve ?local
+                    H2_server.serve ?settings:h2
                       ~hooks:{hooks with inspect= (fun p -> probe := Some p)}
                       (ctx ?stop config) (wrap flow) handler ) )
           in
@@ -569,8 +570,8 @@ let serve_with ?local ?(config = config) ?settings ?(wrap = Fun.id) ?stop
           ; records= probe.records ()
           ; live= probe.live () } ) )
 
-let serve ?local ?config ?settings ?wrap ?stop sim handler f =
-  serve_with ?local ?config ?settings ?wrap ?stop sim handler (fun c _ -> f c)
+let serve ?h2 ?config ?settings ?wrap ?stop sim handler f =
+  serve_with ?h2 ?config ?settings ?wrap ?stop sim handler (fun c _ -> f c)
 
 (* The time since [t0], in nanoseconds. *)
 let since t0 = Span.to_ns (Time.diff Mono (Time.now Mono) t0)
@@ -1441,12 +1442,10 @@ let engine_tests =
           let handler =
             paths [("/wait", fun _ -> Ivar.fill !started () ; sync never)]
           in
-          let local =
-            {(H2_server.default_local config) with max_concurrent_streams= 4}
-          in
+          let h2 = {Settings.default with max_concurrent_streams= 4} in
           let r =
             Sim_support.run (fun sim ->
-                serve ~local sim handler (fun c ->
+                serve ~h2 sim handler (fun c ->
                     for i = 0 to 7 do
                       started := Ivar.create () ;
                       Fake.request c
@@ -1498,9 +1497,7 @@ let engine_tests =
             r.reports )
     ; test "a head over max_header_list_size: 431, the next one decodes"
         (fun () ->
-          let local =
-            {(H2_server.default_local config) with max_header_list_size= 1000}
-          in
+          let h2 = {Settings.default with max_header_list_size= Some 1000} in
           let handler req =
             Response.string
               (Option.value
@@ -1509,7 +1506,7 @@ let engine_tests =
           in
           let r =
             Sim_support.run (fun sim ->
-                serve ~local sim handler (fun c ->
+                serve ~h2 sim handler (fun c ->
                     Fake.send c
                       (headers_frame ~end_stream:true 1
                          ( dynamic_entry
@@ -1844,17 +1841,17 @@ let read_all flow =
 
 let rule_tests =
   group "Engine rules"
-    [ test "default_local: the default settings" (fun () ->
-          let l =
-            H2_server.default_local {config with max_header_bytes= 1234}
+    [ test "the default settings in our SETTINGS frame" (fun () ->
+          let r =
+            Sim_support.run (fun sim ->
+                serve ~config:{config with max_header_bytes= 1234} sim hello
+                  (fun c -> Fake.server_settings c ) )
           in
           equal
-            Testable.(list int)
-            [100; 65535; 4096; 1234]
-            [ l.max_concurrent_streams
-            ; l.initial_window
-            ; l.header_table_size
-            ; l.max_header_list_size ] )
+            Testable.(list (pair int int))
+            [(0x1, 4096); (0x3, 100); (initial_window_size, 65535); (0x6, 1234)]
+            r.value ;
+          clean_end r )
     ; test "W serves the streams in turn: one DATA frame of each" (fun () ->
           let handler =
             paths
@@ -2796,12 +2793,10 @@ let rule_tests =
           in
           (* Two streams: a connection window of 131070, with a WINDOW_UPDATE at
              65535 bytes of credit. *)
-          let local =
-            {(H2_server.default_local config) with max_concurrent_streams= 2}
-          in
+          let h2 = {Settings.default with max_concurrent_streams= 2} in
           let r =
             Sim_support.run (fun sim ->
-                serve ~local sim handler (fun c ->
+                serve ~h2 sim handler (fun c ->
                     Fake.request ~end_stream:false c ~stream:1 (post ()) ;
                     ignore (Fake.response c ~stream:1) ;
                     Fake.data c ~stream:1 (String.make 65535 'x') ;

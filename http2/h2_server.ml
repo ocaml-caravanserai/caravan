@@ -17,12 +17,6 @@ module Date = Caravan.Private.Date
 module Deadline = Caravan.Private.Deadline
 module Message_rules = Caravan.Private.Message_rules
 
-let default_local (config : Config.t) : Conn_state.local =
-  { max_concurrent_streams= 100
-  ; initial_window= 65535
-  ; header_table_size= 4096
-  ; max_header_list_size= config.max_header_bytes }
-
 (* The largest frame that the engine reads and writes. The engine announces no
    SETTINGS_MAX_FRAME_SIZE, and each peer accepts this size. *)
 let max_frame = 16384
@@ -31,6 +25,33 @@ let max_frame = 16384
    copies them under the mutex, thus the limit keeps the time under the mutex
    and the scratch memory small. *)
 let max_parts = 4
+
+(* A DATA part of less than this, because of a small send window, gives no token
+   back to the WINDOW_UPDATE and PING buckets. The bound is absolute on purpose:
+   a bound that follows the window of the client would let a client with a
+   window of 1 byte cancel it. The cost: a client with a stream window under
+   1024 bytes that gives credit for each frame ends with GOAWAY after
+   [frame_tokens] WINDOW_UPDATE frames (then [frame_refill] in each second). The
+   clients that we know give credit in steps of 32 KiB or more. *)
+let small_data = 1024
+
+(* The values of our SETTINGS frame. *)
+let local (s : Settings.t) (config : Config.t) : Conn_state.local =
+  { max_concurrent_streams= s.max_concurrent_streams
+  ; initial_window= s.initial_window
+  ; header_table_size= s.header_table_size
+  ; max_header_list_size=
+      Option.value s.max_header_list_size ~default:config.max_header_bytes }
+
+(* The rapid reset bucket: [reset_budget] tokens ([2 * max_concurrent_streams]
+   by default), and [max_concurrent_streams] back in each second. The two are at
+   most [Limits.max_tokens], the range of a bucket. *)
+let reset_bucket (s : Settings.t) =
+  Limits.Bucket.create
+    ~tokens:
+      (min Limits.max_tokens
+         (Option.value s.reset_budget ~default:(2 * s.max_concurrent_streams)) )
+    ~refill:(min Limits.max_tokens s.max_concurrent_streams)
 
 (* {1 The state}
 
@@ -71,6 +92,11 @@ type item =
    queue takes nothing. *)
 type response = No_head | Head | Ended | Closed
 
+(* Where W finds a stream. [Out]: in no list (no item). [Queued]: in
+   [conn.sending]. [Parked]: in [conn.parked_streams], because the loan at the
+   head of its queue waits for stream window. *)
+type place = Out | Queued | Parked
+
 (* The state of the body of a request. *)
 type inbound = Receiving | Complete | Failed of exn
 
@@ -83,7 +109,8 @@ type stream =
   ; output: Fiber.Condition.t (* the loans and the flushes wait *)
   ; items: item Queue.t
   ; mutable response: response
-  ; mutable sending: bool (* the stream is in [conn.sending] *)
+  ; mutable place: place
+  ; mutable flush_waits: int (* the writers that wait for a flush *)
   ; mutable taken: int (* the number of the last item that W took *)
   ; mutable data: bytes
   ; mutable data_off: int
@@ -126,6 +153,10 @@ type conn =
   ; updates: (int * int) Queue.t
         (* the WINDOW_UPDATE frames of the streams: the stream, the increment *)
   ; sending: stream Queue.t (* the streams with items, in round robin *)
+  ; parked_streams: (int, stream) Hashtbl.t
+        (* the streams out of the round: the loan at the head of the queue waits
+           for stream window. A credit for the stream puts it back. *)
+  ; mutable visits: int (* the streams that the rounds visited, for tests *)
   ; mutable phase: phase
   ; mutable broken: bool (* a write of W failed *)
   ; mutable live: int (* the stream fibers that did not end *)
@@ -145,9 +176,16 @@ type conn =
         (* the watchdog saw the stop of the server, and R did not handle it *)
   ; mutable due: bool
         (* the watchdog saw a deadline that passed: R reads the state again *)
+  ; mutable unacked_since: Clock.mono option
+        (* our SETTINGS frame went in the queue at this time, and its ACK did
+           not come *)
+  ; settings: Settings.t
+  ; floods: Limits.t (* the buckets of the frame classes *)
+  ; resets: Limits.Bucket.t (* the rapid reset budget *)
   ; mutable seq: int (* the number of the last item that W took *)
   ; mutable flushed: int (* the items up to this number went to the flow *)
-  ; mutable flush_waiters: int
+  ; flush_streams: (int, stream) Hashtbl.t
+        (* the streams with a writer that waits for a flush *)
   ; mutable yield_hint: bool
         (* a round completed the last loan of a body with a known length: its
            writer queues the end at once *)
@@ -213,12 +251,46 @@ let wait_timed c cond span ready =
 
 (* {1 The queues of W} *)
 
+(* The stream window of [s] is positive: a loan can go when the connection
+   window permits. *)
+let has_window c s = Conn_state.stream_window c.cs ~stream:s.id > 0
+
+(* W takes [s] out of its round: the loan at the head of its queue waits for
+   stream window. *)
+let park c s =
+  s.place <- Parked ;
+  Hashtbl.replace c.parked_streams s.id s
+
+(* A parked stream goes back to the round. *)
+let unpark c s =
+  if s.place = Parked then begin
+    Hashtbl.remove c.parked_streams s.id ;
+    s.place <- Queued ;
+    Queue.push s c.sending ;
+    Fiber.Condition.broadcast c.work
+  end
+
+(* The parked streams that a credit gave a positive stream window go back to the
+   round. *)
+let unpark_credited c =
+  Hashtbl.fold
+    (fun _ s acc -> if has_window c s then s :: acc else acc)
+    c.parked_streams []
+  |> List.iter (unpark c)
+
+(* A new item also puts a parked stream back: W then takes it (for example the
+   RST of a write timeout, or of the exit path after the end sequence dropped
+   the loan) or parks the stream again. *)
 let push c s item =
   Queue.push item s.items ;
-  if not s.sending then begin
-    s.sending <- true ;
-    Queue.push s c.sending
-  end ;
+  ( match s.place with
+  | Parked ->
+      unpark c s
+  | Out ->
+      s.place <- Queued ;
+      Queue.push s c.sending
+  | Queued ->
+      () ) ;
   Fiber.Condition.broadcast c.work
 
 let push_zero c f =
@@ -274,8 +346,11 @@ let queue_end_reset c s =
 
 (* The record of [s] goes when its fiber ended and W took its items. *)
 let forget c s =
-  if (not s.running) && Queue.is_empty s.items then
-    Hashtbl.remove c.streams s.id
+  if (not s.running) && Queue.is_empty s.items then begin
+    Hashtbl.remove c.streams s.id ;
+    (* A client reset can empty the queue of a parked stream. *)
+    Hashtbl.remove c.parked_streams s.id
+  end
 
 (* Fails the body of the request of [s] with [e], if it did not end. *)
 let truncate s e =
@@ -308,19 +383,34 @@ let reset_new c ~stream code =
   | None ->
       ()
 
+(* The time since the start of the engine, in nanoseconds. *)
+let now c () =
+  Int64.to_int (Span.to_ns (Time.diff Mono (Time.now Mono) c.started))
+
+(* Under [m]: a stream that ends with no response of a handler costs the rapid
+   reset budget. The result is [false] if the budget had no token: then R ends
+   the connection. *)
+let spend_reset c = Limits.Bucket.take c.resets ~now:(now c)
+
+let reset_over =
+  (Error.Enhance_your_calm, "too many streams that end with no response")
+
 (* Under [m]: a RST_STREAM frame of the client. The body fails, and no frame of
    the stream follows. The state can give no [Peer_reset] event for it: our
    END_STREAM is in the queue, so the state has the stream as closed, but W did
-   not write all of its items yet. The result is the fiber to cancel. *)
+   not write all of its items yet. The result is the fiber to cancel, and
+   [false] if the rapid reset budget had no token. *)
 let peer_reset c stream =
   match Hashtbl.find_opt c.streams stream with
   | Some s ->
+      (* A reset before our final head costs the rapid reset budget. *)
+      let ok = s.response <> No_head || spend_reset c in
       truncate s Body.Truncated ;
       drop_items s ;
       s.response <- Closed ;
-      s.fiber
+      (s.fiber, ok)
   | None ->
-      None
+      (None, true)
 
 let fiber_of c stream =
   Option.bind (Hashtbl.find_opt c.streams stream) (fun s -> s.fiber)
@@ -384,22 +474,32 @@ let take_items c s ~parts acc =
         next () ;
         loop (Out_frame (Rst_stream {stream= s.id; code}) :: acc)
     | Some (Loan l) ->
-        let n =
-          min
-            (Conn_state.send_window c.cs ~stream:s.id)
-            (min max_frame (l.len - l.pos))
-        in
+        let part = min max_frame (l.len - l.pos) in
+        let n = min (Conn_state.send_window c.cs ~stream:s.id) part in
         if n <= 0 then begin
-          (* The writer waits for window: it starts its timer. *)
+          (* The writer waits for window: it starts its timer. With no stream
+             window, the stream leaves the round until a credit for it. With no
+             connection window, it stays: then each stream waits, and a credit
+             for the connection would have to put each one back. *)
           if not l.stalled then begin
             l.stalled <- true ;
             Fiber.Condition.broadcast s.output
           end ;
+          if not (has_window c s) then park c s ;
           acc
         end
         else begin
           let buf = scratch c !parts in
           incr parts ;
+          (* The client can answer with a WINDOW_UPDATE frame of the stream and
+             one of the connection, and with a PING that measures the link. A
+             small part because of a small window gives no token: thus a client
+             that gives credit in small steps empties the bucket, and the small
+             DATA frames have a bound. *)
+          if n >= min small_data part then begin
+            Limits.give c.floods Window_update_frame 2 ;
+            Limits.give c.floods Ping_frame 1
+          end ;
           Bytes.blit l.buf (l.off + l.pos) buf 0 n ;
           Conn_state.sent c.cs ~stream:s.id n ;
           l.pos <- l.pos + n ;
@@ -446,12 +546,13 @@ let round c =
     let rec visit k =
       if k > 0 && !parts < max_parts then begin
         let s = Queue.pop c.sending in
+        c.visits <- c.visits + 1 ;
         outs := take_items c s ~parts !outs ;
         if Queue.is_empty s.items then begin
-          s.sending <- false ;
+          s.place <- Out ;
           forget c s
         end
-        else Queue.push s c.sending ;
+        else if s.place <> Parked then Queue.push s c.sending ;
         visit (k - 1)
       end
     in
@@ -471,10 +572,12 @@ let write_out w = function
 let flushed c seq =
   c.flushed <- seq ;
   if
-    ( c.flush_waiters > 0 )
+    ( Hashtbl.length c.flush_streams
+    > 0 )
     [@mutate
       off "a broadcast with no waiter has no effect: the test saves the walk"]
-  then Hashtbl.iter (fun _ s -> Fiber.Condition.broadcast s.output) c.streams
+  then
+    Hashtbl.iter (fun _ s -> Fiber.Condition.broadcast s.output) c.flush_streams
 
 (* What W does next. *)
 type step =
@@ -508,7 +611,8 @@ let writer c flow =
         Fiber.Condition.wait c.work c.m ;
         next ~dirty ~yielded
     | outs, zero ->
-        Write {outs; flush= zero || c.flush_waiters > 0; seq= c.seq}
+        Write
+          {outs; flush= zero || Hashtbl.length c.flush_streams > 0; seq= c.seq}
   in
   let flush seq =
     Writer.flush w ;
@@ -745,7 +849,8 @@ let sink c s ~block ~length =
             if refuses c s then `Closed
             else begin
               commit c s block ;
-              c.flush_waiters <- c.flush_waiters + 1 ;
+              s.flush_waits <- s.flush_waits + 1 ;
+              Hashtbl.replace c.flush_streams s.id s ;
               let r =
                 wait_locked c s.output (fun () ->
                     if Queue.is_empty s.items && c.flushed >= s.taken then
@@ -753,7 +858,8 @@ let sink c s ~block ~length =
                     else if refuses c s then Some `Closed
                     else None )
               in
-              c.flush_waiters <- c.flush_waiters - 1 ;
+              s.flush_waits <- s.flush_waits - 1 ;
+              if s.flush_waits = 0 then Hashtbl.remove c.flush_streams s.id ;
               r
             end )
       in
@@ -887,6 +993,8 @@ let exit_path c s pending =
       | Head ->
           reset_new c ~stream:s.id Cancel
       | Ended ->
+          (* A response that ended gives back the rapid reset budget. *)
+          Limits.Bucket.give c.resets 1 ;
           queue_end_reset c s
       | No_head | Closed ->
           () ) ;
@@ -937,7 +1045,8 @@ let new_stream id ~end_stream ~continue =
   ; output= Fiber.Condition.create ()
   ; items= Queue.create ()
   ; response= No_head
-  ; sending= false
+  ; place= Out
+  ; flush_waits= 0
   ; taken= (0 [@mutate off "flush pushes the head first, thus W sets it"])
   ; data= Bytes.empty
   ; data_off= 0
@@ -1056,8 +1165,9 @@ let all_fibers c =
    the last one. [Check]: a stream fiber is live. At the check, the watchdog
    reads the state again. Each fiber that was live at that read ends later, thus
    the idle deadline is not earlier than the check. Thus the end of a stream
-   fiber needs no kick of the watchdog. *)
-type timer = Preface | Block | Idle | Check
+   fiber needs no kick of the watchdog. [Settings_ack]: the ACK of our SETTINGS
+   frame, from the time that it went in the queue. *)
+type timer = Preface | Block | Idle | Check | Settings_ack
 
 (* An [idle_timeout] below 100 ms has no [Check]: a check so short makes the
    watchdog wake too often, and 0 makes it spin. Then the last end of a stream
@@ -1067,15 +1177,43 @@ let exact_idle (config : Config.t) =
     (Span.ms (100 [@mutate off "the floor needs no exact value"]))
   < (0 [@mutate off "an idle_timeout of exactly 100 ms can use the two ways"])
 
-(* Under [m]: the deadline of the timers, at the time [now]. The first that
-   applies of the preface, the header block, idle and the check. When R waits
-   for the end of the last stream fiber, that end wakes R: no idle timer and no
-   check. *)
+(* Under [m]: the deadline of the timers, at the time [now]. The earliest of the
+   ACK timer and of the first timer that applies of the preface, the header
+   block, idle and the check. A header block is not idle, thus the block timer
+   comes before idle. When R waits for the end of the last stream fiber, that
+   end wakes R: no idle timer and no check. The ACK timer applies after the
+   first SETTINGS frame of the client (before it, the preface timer applies),
+   and not after the end of the input (no ACK can come). *)
 let deadline c ~now =
   let config = c.config in
   let at timer since span =
     Option.map (fun at -> (timer, at)) (Time.add Mono since span)
   in
+  let ack =
+    match c.unacked_since with
+    | Some since when c.start = Started && c.input <> Ended ->
+        at Settings_ack since config.header_timeout
+    | _ ->
+        None
+  in
+  let earliest a b =
+    match (a, b) with
+    | Some (_, x), Some (_, y)
+      when ( Span.compare (Time.diff Mono y x) Span.zero
+           < 0 )
+           [@mutate
+             off
+               "at equal deadlines the two timers end the connection, thus < \
+                and <= give the same result. A test checks that the earlier \
+                timer wins"] ->
+        b
+    | Some _, _ ->
+        a
+    | None, _ ->
+        b
+  in
+  earliest ack
+  @@
   match (c.start, c.block_since) with
   | (Before_preface | Before_settings), _ ->
       at Preface c.started config.header_timeout
@@ -1277,6 +1415,10 @@ let start r ~stream ~end_stream (head : Message.request_head) =
           s.running <- true ;
           c.live <- c.live + 1 ;
           Hashtbl.replace c.streams stream s ;
+          (* A stream that starts a handler gives back a PRIORITY token and an
+             unknown token. *)
+          Limits.give c.floods Priority_frame 1 ;
+          Limits.give c.floods Unknown_frame 1 ;
           Some s
         end )
   in
@@ -1332,15 +1474,18 @@ let on_request r ~stream ~end_stream decoded =
   let c = r.c in
   match decoded with
   | `Too_large ->
-      early r ~stream ~end_stream 431
+      early r ~stream ~end_stream 431 ;
+      Ok ()
   | `Fields l -> (
     match Message.request l with
     | Error (Malformed _) ->
         locked c (fun () ->
             reset_new c ~stream Protocol_error ;
-            queue_frames c (Conn_state.discard c.cs ~stream) )
+            queue_frames c (Conn_state.discard c.cs ~stream) ;
+            if spend_reset c then Ok () else Error reset_over )
     | Error Misdirected ->
-        early r ~stream ~end_stream 421
+        early r ~stream ~end_stream 421 ;
+        Ok ()
     | Ok head ->
         let too_large =
           match (c.config.max_body, head.content_length) with
@@ -1351,7 +1496,8 @@ let on_request r ~stream ~end_stream decoded =
         in
         if head.expect = `Unknown then early r ~stream ~end_stream 417
         else if too_large then early r ~stream ~end_stream 413
-        else start r ~stream ~end_stream head )
+        else start r ~stream ~end_stream head ;
+        Ok () )
 
 (* A header block. Each block is decoded, whatever its use: the dynamic table
    needs each one. *)
@@ -1363,50 +1509,102 @@ let on_block r (stream, block, end_stream, use) =
   with
   | exception Error.Hpack reason ->
       Error (Error.Compression_error, reason)
-  | decoded ->
-      ( match (use : Conn_state.use) with
-      | Ignored ->
-          ()
-      | Refused ->
-          locked c (fun () -> reset_recorded c ~stream Refused_stream)
-      | Reset code ->
-          (* A header block on an open stream is an error of the body. *)
-          locked c (fun () -> reset_recorded c ~stream code)
-      | Trailers ->
-          on_trailers c ~stream decoded
-      | Open ->
-          on_request r ~stream ~end_stream decoded ) ;
-      Ok ()
+  | decoded -> (
+    match (use : Conn_state.use) with
+    | Ignored ->
+        Ok ()
+    | Refused ->
+        (* A refusal by the count of the open streams of the protocol costs the
+           rapid reset budget. A refusal only by the live fibers costs nothing:
+           the client can reset its streams and open new ones in one write,
+           before the cancelled fibers end. *)
+        locked c (fun () ->
+            reset_recorded c ~stream Refused_stream ;
+            if
+              Conn_state.active_streams c.cs < c.settings.max_concurrent_streams
+              || spend_reset c
+            then Ok ()
+            else Error reset_over )
+    | Reset code ->
+        (* A header block on an open stream is an error of the body. *)
+        locked c (fun () -> reset_recorded c ~stream code) ;
+        Ok ()
+    | Trailers ->
+        on_trailers c ~stream decoded ;
+        Ok ()
+    | Open ->
+        on_request r ~stream ~end_stream decoded )
+
+(* Under [m]: the bucket of the class of [frame] takes a token. The result is
+   the reason of the end, if no token was there. *)
+let flood c k =
+  if Limits.take c.floods k ~now:(now c) then None
+  else Some (Printf.sprintf "a flood of %s frames" (Limits.name k))
 
 let on_frame r frame =
   let c = r.c in
   match
     locked c (fun () ->
-        match Conn_state.on_frame c.cs ~live:c.live frame with
-        | Error e ->
-            Error e
-        | Ok events ->
-            let blocks, kills, goaway = on_events c events in
-            let kills =
-              match frame with
-              | Rst_stream {stream; _} ->
-                  Option.to_list (peer_reset c stream) @ kills
+        match Option.bind (Limits.class_of frame) (flood c) with
+        | Some reason ->
+            Error (Error.Enhance_your_calm, reason)
+        | None -> (
+          match Conn_state.on_frame c.cs ~live:c.live frame with
+          | Error e ->
+              Error e
+          | Ok events -> (
+              let blocks, kills, goaway = on_events c events in
+              let kills, closed_reset, budget =
+                match frame with
+                | Rst_stream {stream; _} ->
+                    (* The state gives [Peer_reset] for a RST_STREAM on an open
+                       stream. With no such event, the stream is closed: a late
+                       RST_STREAM, which takes a token of its class. *)
+                    let closed =
+                      not
+                        (List.exists
+                           (function
+                             | Conn_state.Peer_reset _ -> true | _ -> false )
+                           events )
+                    in
+                    let kill, ok = peer_reset c stream in
+                    (Option.to_list kill @ kills, closed, ok)
+                | _ ->
+                    (kills, false, true)
+              in
+              (* The timers. The state gives an error for a first frame other
+                 than SETTINGS. The first SETTINGS frame, and the start and the
+                 end of a header block, can move the deadline earlier: they kick
+                 the watchdog. *)
+              let block_open = Conn_state.block_open c.cs in
+              if c.start = Before_settings then kick c ;
+              if block_open <> (c.block_since <> None) then kick c ;
+              c.start <- Started ;
+              c.block_since <-
+                ( if not block_open then None
+                  else if c.block_since = None then Some (Time.now Mono)
+                  else c.block_since ) ;
+              ( match frame with
+              | Settings {ack= true; _} ->
+                  c.unacked_since <- None
+              | Settings {ack= false; _} ->
+                  (* A larger initial window can give credit to each stream. *)
+                  unpark_credited c
+              | Window_update {stream; _} when stream <> 0 ->
+                  Option.iter
+                    (fun s -> if has_window c s then unpark c s)
+                    (Hashtbl.find_opt c.parked_streams stream)
               | _ ->
-                  kills
-            in
-            (* The timers. The state gives an error for a first frame other than
-               SETTINGS. The first SETTINGS frame, and the start and the end of
-               a header block, can move the deadline earlier: they kick the
-               watchdog. *)
-            let block_open = Conn_state.block_open c.cs in
-            if c.start = Before_settings then kick c ;
-            if block_open <> (c.block_since <> None) then kick c ;
-            c.start <- Started ;
-            c.block_since <-
-              ( if not block_open then None
-                else if c.block_since = None then Some (Time.now Mono)
-                else c.block_since ) ;
-            Ok (blocks, kills, goaway) )
+                  () ) ;
+              match if closed_reset then flood c Closed_reset else None with
+              | Some reason ->
+                  Error (Enhance_your_calm, reason)
+              | None ->
+                  if not budget then Error reset_over
+                  else if Queue.length c.zero > c.settings.control_queue then
+                    Error
+                      (Enhance_your_calm, "too many frames wait for stream 0")
+                  else Ok (blocks, kills, goaway) ) ) )
   with
   | Error e ->
       Error e
@@ -1443,12 +1641,14 @@ let connection_error r code reason = finish ~goaway:(code, reason) r `Error
    (RFC 9113 section 6.8). After it, the state ignores the new streams. *)
 let drain r reason =
   locked r.c (fun () ->
-      push_zero r.c (Conn_state.goaway r.c.cs No_error reason) ;
-      if r.c.input = Reading then r.c.input <- Draining )
+      if r.c.input = Reading then begin
+        push_zero r.c (Conn_state.goaway r.c.cs No_error reason) ;
+        r.c.input <- Draining
+      end )
 
 (* A deadline that passed. The preface: the connection closes, with no GOAWAY. A
    header block: GOAWAY ENHANCE_YOUR_CALM, each fiber is cancelled. Idle: GOAWAY
-   NO_ERROR. *)
+   NO_ERROR. The ACK of our SETTINGS: GOAWAY SETTINGS_TIMEOUT. *)
 let rec expired r = function
   | Preface ->
       finish ~linger:false r `Error
@@ -1457,6 +1657,8 @@ let rec expired r = function
         "a header block that did not end in time"
   | Idle ->
       finish ~goaway:(Error.No_error, "idle") r `Other
+  | Settings_ack ->
+      connection_error r Settings_timeout "no ACK of our SETTINGS in time"
   | Check ->
       (* [due_timer] never gives a check (see there). A check only reads the
          state again. *)
@@ -1530,6 +1732,10 @@ and preface r =
       Reader.consume r.frames 24 ;
       locked r.c (fun () ->
           r.c.start <- Before_settings ;
+          (* The ACK timer starts after the preface timer, with the same span,
+             and it applies only after the first SETTINGS frame of the client:
+             that frame kicks the watchdog. *)
+          r.c.unacked_since <- Some (Time.now Mono) ;
           List.iter (push_zero r.c) (Conn_state.start_frames r.c.cs) ) ;
       step r
   | () | (exception (End_of_file | Flow.Closed)) ->
@@ -1543,6 +1749,8 @@ type probe =
   ; live: unit -> int
   ; inbound: unit -> int
   ; scratch: unit -> int
+  ; visits: unit -> int
+  ; parked: unit -> int
   ; table_size: unit -> int }
 
 type hooks =
@@ -1554,10 +1762,10 @@ type hooks =
 let no_hooks =
   {inspect= ignore; on_yield= ignore; on_wait= ignore; on_step= ignore}
 
-let serve ?local ?(hooks = no_hooks) : Engine.t =
+let serve ?(settings = Settings.default) ?(hooks = no_hooks) : Engine.t =
  fun ctx flow handler ->
   let config = ctx.config in
-  let local = Option.value local ~default:(default_local config) in
+  let local = local settings config in
   let now = Time.now Mono in
   let c =
     { m= Fiber.Mutex.create ()
@@ -1573,6 +1781,8 @@ let serve ?local ?(hooks = no_hooks) : Engine.t =
     ; goaway= None
     ; updates= Queue.create ()
     ; sending= Queue.create ()
+    ; parked_streams= Hashtbl.create 16
+    ; visits= (0 [@mutate off "the tests read only the changes of this count"])
     ; phase= Serving
     ; broken= false
     ; live= 0
@@ -1584,6 +1794,12 @@ let serve ?local ?(hooks = no_hooks) : Engine.t =
     ; input= Reading
     ; block_since= None
     ; stopping= false
+    ; unacked_since= None
+    ; settings
+    ; floods=
+        Limits.create ~tokens:settings.frame_tokens
+          ~refill:settings.frame_refill
+    ; resets= reset_bucket settings
     ; due= false [@mutate off "a due at the start costs one read of the timers"]
     ; seq= (0 [@mutate off "the item numbers only compare with each other"])
     ; flushed=
@@ -1592,7 +1808,7 @@ let serve ?local ?(hooks = no_hooks) : Engine.t =
           off
             "a waiter of a flush wakes only after a flush of W, after a loan \
              of its stream (number 2 or more), or after a reset"] )
-    ; flush_waiters= 0
+    ; flush_streams= Hashtbl.create 16
     ; yield_hint= false
     ; scratch= [||] }
   in
@@ -1603,6 +1819,8 @@ let serve ?local ?(hooks = no_hooks) : Engine.t =
     ; live= (fun () -> c.live)
     ; inbound= (fun () -> sum (fun s -> Bytes.length s.data))
     ; scratch= (fun () -> Array.length c.scratch)
+    ; visits= (fun () -> c.visits)
+    ; parked= (fun () -> Hashtbl.length c.parked_streams)
     ; table_size= (fun () -> Hpack.Decoder.table_size c.decoder) } ;
   Flow.set_write_timeout flow (Some config.write_timeout) ;
   let w =
