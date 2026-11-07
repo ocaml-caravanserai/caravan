@@ -1,7 +1,7 @@
 (** The HTTP/2 server engine. See h2_server.mli.
 
     The words of the comments:
-    - R, W and the stream fibers: see h2_server.mli.
+    - R, W, the stream fibers and the watchdog: see h2_server.mli.
     - "Fail the body": the read of the request body raises [Body.Truncated] (or
       [Body.Too_large]), and its waiters wake.
     - "Cancel the fiber": R cancels the stream fiber with [Promise.cancel].
@@ -101,6 +101,15 @@ type stream =
    DATA. *)
 type phase = Serving | Closing of [`Error | `Other]
 
+(* The start of the connection: the preface of the client, then its first
+   SETTINGS frame. *)
+type start = Before_preface | Before_settings | Started
+
+(* The input of R. [Draining]: no new stream, after our GOAWAY NO_ERROR.
+   [Ended]: the input ended. In these two, the connection ends when no stream
+   fiber is live. *)
+type input = Reading | Draining | Ended
+
 type conn =
   { m: Fiber.Mutex.t
   ; work: Fiber.Condition.t (* W waits for work *)
@@ -119,10 +128,23 @@ type conn =
   ; sending: stream Queue.t (* the streams with items, in round robin *)
   ; mutable phase: phase
   ; mutable broken: bool (* a write of W failed *)
-  ; mutable reading: bool
-        (* R reads frames, and needs no wake for [live]. An idle timer that
-           starts when [live] becomes 0 needs that wake also while R reads. *)
   ; mutable live: int (* the stream fibers that did not end *)
+  ; mutable idle_since: Clock.mono
+        (* the start, or the end of the last stream fiber: the start of the idle
+           time *)
+  ; started: Clock.mono (* the start of the engine *)
+  ; exact: bool
+        (* [idle_timeout] below 100 ms: the last end of a stream fiber kicks the
+           watchdog *)
+  ; kick: int Var.t (* the watchdog waits for a change *)
+  ; mutable start: start
+  ; mutable input: input
+  ; mutable block_since: Clock.mono option
+        (* the HEADERS frame of a header block that did not end *)
+  ; mutable stopping: bool
+        (* the watchdog saw the stop of the server, and R did not handle it *)
+  ; mutable due: bool
+        (* the watchdog saw a deadline that passed: R reads the state again *)
   ; mutable seq: int (* the number of the last item that W took *)
   ; mutable flushed: int (* the items up to this number went to the flow *)
   ; mutable flush_waiters: int
@@ -146,6 +168,12 @@ let wake_r c =
   Var.set c.wake
     (( Var.get c.wake + 1 )
      [@mutate off "each new value is a change: R compares the values"] )
+
+let kick c =
+  Var.set c.kick
+    (( Var.get c.kick + 1 )
+     [@mutate
+       off "each new value is a change: the watchdog compares the values"] )
 
 let closing c = match c.phase with Closing _ -> true | Serving -> false
 
@@ -864,7 +892,11 @@ let exit_path c s pending =
           () ) ;
       queue_frames c (Conn_state.discard c.cs ~stream:s.id) ;
       forget c s ;
-      if not c.reading then wake_r c )
+      if c.live = 0 then begin
+        c.idle_since <- Time.now Mono ;
+        if c.input <> Reading then wake_r c ;
+        if c.exact then kick c
+      end )
 
 let stream_fiber c s ~meth handler req () =
   let pending = ref None in
@@ -986,31 +1018,31 @@ let on_data c ~stream ~data ~end_stream =
    handler ends. *)
 let on_events c events =
   List.fold_left
-    (fun (blocks, kills) (e : Conn_state.event) ->
+    (fun (blocks, kills, goaway) (e : Conn_state.event) ->
       match e with
       | Send f ->
-          queue_frame c f ; (blocks, kills)
+          queue_frame c f ; (blocks, kills, goaway)
       | Header_block {stream; block; end_stream; use} ->
-          ((stream, block, end_stream, use) :: blocks, kills)
+          ((stream, block, end_stream, use) :: blocks, kills, goaway)
       | Data {stream; data; end_stream} ->
           on_data c ~stream ~data ~end_stream ;
-          (blocks, kills)
+          (blocks, kills, goaway)
       | Body_error {stream} ->
           reset_recorded c ~stream Protocol_error ;
-          (blocks, kills)
+          (blocks, kills, goaway)
       | Stream_error {stream; code} ->
           reset_recorded c ~stream code ;
-          (blocks, Option.to_list (fiber_of c stream) @ kills)
+          (blocks, Option.to_list (fiber_of c stream) @ kills, goaway)
       | Peer_reset _ ->
           (* R handles the RST_STREAM frame itself (see [peer_reset]). *)
-          (blocks, kills)
+          (blocks, kills, goaway)
       | Credit ->
           Fiber.Condition.broadcast c.work ;
-          (blocks, kills)
-      | Peer_goaway _ ->
-          (* The rules of a GOAWAY of the client are not in this version. *)
-          (blocks, kills) )
-    ([], []) events
+          (blocks, kills, goaway)
+      | Peer_goaway {code; _} ->
+          (* R applies it after the frame, in [step]. *)
+          (blocks, kills, Some code) )
+    ([], [], None) events
 
 let cancel_all kills = List.iter Promise.cancel kills
 
@@ -1018,7 +1050,122 @@ let cancel_all kills = List.iter Promise.cancel kills
 let all_fibers c =
   Hashtbl.fold (fun _ s acc -> Option.to_list s.fiber @ acc) c.streams []
 
-(* The state of R. [seen] is the view of [wake] at the start of each step. *)
+(* The timers of the connection. [Preface]: the preface and the first SETTINGS
+   frame of the client, from the start. [Block]: a header block that did not
+   end, from its HEADERS frame. [Idle]: no live stream fiber, from the end of
+   the last one. [Check]: a stream fiber is live. At the check, the watchdog
+   reads the state again. Each fiber that was live at that read ends later, thus
+   the idle deadline is not earlier than the check. Thus the end of a stream
+   fiber needs no kick of the watchdog. *)
+type timer = Preface | Block | Idle | Check
+
+(* An [idle_timeout] below 100 ms has no [Check]: a check so short makes the
+   watchdog wake too often, and 0 makes it spin. Then the last end of a stream
+   fiber kicks the watchdog, and the idle timer is exact. *)
+let exact_idle (config : Config.t) =
+  Span.compare config.idle_timeout
+    (Span.ms (100 [@mutate off "the floor needs no exact value"]))
+  < (0 [@mutate off "an idle_timeout of exactly 100 ms can use the two ways"])
+
+(* Under [m]: the deadline of the timers, at the time [now]. The first that
+   applies of the preface, the header block, idle and the check. When R waits
+   for the end of the last stream fiber, that end wakes R: no idle timer and no
+   check. *)
+let deadline c ~now =
+  let config = c.config in
+  let at timer since span =
+    Option.map (fun at -> (timer, at)) (Time.add Mono since span)
+  in
+  match (c.start, c.block_since) with
+  | (Before_preface | Before_settings), _ ->
+      at Preface c.started config.header_timeout
+  | Started, Some since ->
+      at Block since config.header_timeout
+  | Started, None when c.input <> Reading ->
+      None
+  | Started, None when c.live = 0 ->
+      at Idle c.idle_since config.idle_timeout
+  | Started, None when c.exact ->
+      None
+  | Started, None ->
+      at Check now config.idle_timeout
+
+let passed ~now at = Span.compare (Time.diff Mono now at) Span.zero >= 0
+
+(* Under [m]: the timer whose deadline passed at the time [now]. The check
+   starts at [now] and has no exact idle timer, thus it never passed. *)
+let due_timer c ~now =
+  match deadline c ~now with
+  | Some (timer, at) when passed ~now at ->
+      Some timer
+  | _ ->
+      None
+
+(** The watchdog of the connection: a fiber that owns the timers and the stop of
+    the server. Thus a wait of R has no timer and no stop event: each wait with
+    a timer puts an entry in the timer heap of weft, and the heap drops it only
+    when it is at the head.
+
+    The watchdog waits for the deadline of [deadline], for a kick, and for the
+    stop until it saw it one time. Its deadlines are lazy: a deadline that moves
+    later needs no kick, because at the old deadline the watchdog reads the
+    state again. A deadline that moves earlier needs a kick: the first SETTINGS
+    frame, the start and the end of a header block (a block that opens no stream
+    fiber gives the idle deadline), and the last end of a stream fiber with an
+    exact idle timer. At a deadline that passed, the watchdog sets [due] and
+    wakes R, then it waits for a kick: R reads the state again. At the stop, it
+    sets [stopping] and wakes R. It is a daemon of the scope: the scope cancels
+    it when W and the stream fibers ended, thus it never keeps the scope alive.
+
+    The writers of the fields that it reads or sets, each under [m]:
+    - [start], [input], [block_since]: R.
+    - [live], [idle_since]: the stream fibers (and R, which starts them).
+    - [due], [stopping]: the watchdog sets them, and R clears them.
+    - [kick] (a Var): R (a frame, a stale [due]) and the stream fibers (the last
+      end with an exact idle timer). *)
+let rec watchdog c stop ~stop_open =
+  let seen = Var.view c.kick in
+  let now = Time.now Mono in
+  let d =
+    locked c (fun () ->
+        match due_timer c ~now with
+        | Some _ ->
+            c.due <- true ;
+            wake_r c ;
+            None
+        | None ->
+            deadline c ~now )
+  in
+  match
+    sync
+      (choose
+         ( wrap (Var.changed seen) (fun _ -> `Kick)
+           ::
+           ( match d with
+           | Some (_, at) ->
+               [wrap (Time.at Mono at) (fun () -> `Kick)]
+           | None ->
+               [] )
+         @ if stop_open then [wrap stop (fun () -> `Stop)] else [] ) )
+  with
+  | `Kick ->
+      watchdog c stop ~stop_open
+  | `Stop ->
+      locked c (fun () ->
+          c.stopping <- true ;
+          wake_r c ) ;
+      watchdog c stop ~stop_open:false
+
+(* What the waits of R watch. Only R uses it. [seen] is the view of [wake] at
+   the start of the step. [on_yield], [on_wait] and [on_step] are the hooks of
+   the tests. *)
+type watch =
+  { mutable seen: int Var.view
+  ; on_yield: unit -> unit
+  ; on_wait: unit -> unit
+  ; on_step: unit -> unit }
+
+(* The state of R. *)
 type reader =
   { c: conn
   ; ctx: Engine.ctx
@@ -1026,24 +1173,24 @@ type reader =
   ; handler: Handler.t
   ; scope: Fiber.scope
   ; frames: Reader.t
-  ; seen: int Var.view ref
+  ; w: watch
   ; writer_fiber: unit Promise.t
   ; scheme: string }
 
-(* The events that end a wait of R, other than its input: a change of [wake].
-   The two waits of R (the guarded read, and the wait after the end of the
-   input) use this list, so that they see the same events. *)
-let wait_events seen = [wrap (Var.changed seen) (fun _ -> `Wake)]
+(* A wait of R, other than for its input: a change of [wake]. The two waits of R
+   (the guarded read, and the wait after the end of the input) use it. *)
+let wake_event w = wrap (Var.changed w.seen) (fun _ -> `Wake)
 
 (* The guarded read of the input. Before each read, a change of [wake] raises
    [Flow.Timeout]: R then looks at the change. When no byte is ready, R waits
-   for the input or for a change. *)
-let rec guarded c flow seen buf off len =
+   for the input or for a change of [wake]. *)
+let rec guarded c w flow buf off len =
+  w.on_yield () ;
   (* The simulator runs the client only at a switch point, thus there the choose
      sees the change. The check and the yield are for a client that keeps the
      socket full. *)
   begin[@mutate off "the choose sees the change in the simulator"] if
-    Var.get c.wake <> Var.value !seen
+    Var.get c.wake <> Var.value w.seen
   then raise Flow.Timeout
   end ;
   begin[@mutate off "the simulator switches at read_now"]
@@ -1053,15 +1200,15 @@ let rec guarded c flow seen buf off len =
   | Some n ->
       n
   | None -> (
-    match
-      sync
-        (choose
-           (wrap (Flow.readable flow) (fun () -> `Ready) :: wait_events !seen) )
-    with
-    | `Ready ->
-        guarded c flow seen buf off len
-    | `Wake ->
-        raise Flow.Timeout )
+      w.on_wait () ;
+      match
+        sync
+          (choose [wrap (Flow.readable flow) (fun () -> `Ready); wake_event w])
+      with
+      | `Ready ->
+          guarded c w flow buf off len
+      | `Wake ->
+          raise Flow.Timeout )
 
 (* The end sequence. R stopped to read. In [Closing], the loans of the writers
    end with an error. An end with an error cancels each stream fiber: after the
@@ -1118,7 +1265,7 @@ let start r ~stream ~end_stream (head : Message.request_head) =
               []
         in
         if broken <> [] then begin
-          ignore (on_events c broken) ;
+          ignore (on_events c broken : _ * _ * _) ;
           queue_frames c (Conn_state.discard c.cs ~stream) ;
           None
         end
@@ -1239,7 +1386,7 @@ let on_frame r frame =
         | Error e ->
             Error e
         | Ok events ->
-            let blocks, kills = on_events c events in
+            let blocks, kills, goaway = on_events c events in
             let kills =
               match frame with
               | Rst_stream {stream; _} ->
@@ -1247,23 +1394,43 @@ let on_frame r frame =
               | _ ->
                   kills
             in
-            Ok (blocks, kills) )
+            (* The timers. The state gives an error for a first frame other than
+               SETTINGS. The first SETTINGS frame, and the start and the end of
+               a header block, can move the deadline earlier: they kick the
+               watchdog. *)
+            let block_open = Conn_state.block_open c.cs in
+            if c.start = Before_settings then kick c ;
+            if block_open <> (c.block_since <> None) then kick c ;
+            c.start <- Started ;
+            c.block_since <-
+              ( if not block_open then None
+                else if c.block_since = None then Some (Time.now Mono)
+                else c.block_since ) ;
+            Ok (blocks, kills, goaway) )
   with
   | Error e ->
       Error e
-  | Ok (blocks, kills) ->
+  | Ok (blocks, kills, goaway) -> (
       cancel_all kills ;
-      List.fold_left
-        (fun res b -> match res with Ok () -> on_block r b | Error _ -> res)
-        (Ok ()) (List.rev blocks)
+      match
+        List.fold_left
+          (fun res b -> match res with Ok () -> on_block r b | Error _ -> res)
+          (Ok ()) (List.rev blocks)
+      with
+      | Error e ->
+          Error e
+      | Ok () ->
+          Ok goaway )
 
-(* The end of the input: each request body fails. With [cancel_on_disconnect],
-   each fiber is cancelled. *)
+(* The end of the input: each request body fails, and a header block that did
+   not end has no timer. With [cancel_on_disconnect], each fiber is cancelled.
+   After this, R does not wait for input. *)
 let input_ended r =
   let c = r.c in
   let kills =
     locked c (fun () ->
-        c.reading <- false ;
+        c.input <- Ended ;
+        c.block_since <- None ;
         Hashtbl.iter (fun _ s -> truncate s Body.Truncated) c.streams ;
         if c.config.cancel_on_disconnect then all_fibers c else [] )
   in
@@ -1271,54 +1438,127 @@ let input_ended r =
 
 let connection_error r code reason = finish ~goaway:(code, reason) r `Error
 
+(* The stop of the server, or a GOAWAY NO_ERROR of the client: no new stream.
+   Our GOAWAY NO_ERROR tells the client the last stream that the engine serves
+   (RFC 9113 section 6.8). After it, the state ignores the new streams. *)
+let drain r reason =
+  locked r.c (fun () ->
+      push_zero r.c (Conn_state.goaway r.c.cs No_error reason) ;
+      if r.c.input = Reading then r.c.input <- Draining )
+
+(* A deadline that passed. The preface: the connection closes, with no GOAWAY. A
+   header block: GOAWAY ENHANCE_YOUR_CALM, each fiber is cancelled. Idle: GOAWAY
+   NO_ERROR. *)
+let rec expired r = function
+  | Preface ->
+      finish ~linger:false r `Error
+  | Block ->
+      connection_error r Enhance_your_calm
+        "a header block that did not end in time"
+  | Idle ->
+      finish ~goaway:(Error.No_error, "idle") r `Other
+  | Check ->
+      (* [due_timer] never gives a check (see there). A check only reads the
+         state again. *)
+      step r
+
 (* A step of R. It takes the view of [wake] before it reads the state, so that
    no change after the read is lost. *)
-let rec step r =
-  let c = r.c in
-  let seen = Var.view c.wake in
-  begin[@mutate
-         off
-           "while R reads, only a write failure changes [wake], and then R \
-            ends. An idle timer that needs a wake at the end of the last \
-            stream changes this"]
-    r.seen := seen
-  end ;
-  let live, broken, reading =
-    locked c (fun () -> (c.live, c.broken, c.reading))
+and step r =
+  let c = r.c and w = r.w in
+  w.on_step () ;
+  w.seen <- Var.view c.wake ;
+  let live, broken, stopping, due, start, input =
+    locked c (fun () ->
+        let stopping = c.stopping in
+        c.stopping <- false ;
+        (c.live, c.broken, stopping, c.due, c.start, c.input) )
   in
   if broken then finish r `Error
-  else if not reading then
-    if live = 0 then finish r `Other
-    else begin
-      ignore (sync (choose (wait_events seen))) ;
-      step r
+  else if stopping then
+    (* The stop: a connection with no first SETTINGS frame closes at once. *)
+    if start = Started then begin
+      drain r "the server stops" ; step r
     end
+    else finish ~linger:false r `Error
+  else if input <> Reading && live = 0 then finish r `Other
+  else if due then (
+    match
+      locked c (fun () ->
+          c.due <- false ;
+          due_timer c ~now:(Time.now Mono) )
+    with
+    | Some timer ->
+        expired r timer
+    | None ->
+        (* The state changed after the read of the watchdog. *)
+        kick c ; step r )
   else
-    match Frame.read r.frames ~max_size:max_frame with
-    | frame -> (
-      match on_frame r frame with
-      | Ok () ->
-          step r
-      | Error (code, reason) ->
-          connection_error r code reason )
-    | exception Flow.Timeout ->
+    match (start, input) with
+    | Before_preface, _ ->
+        preface r
+    | _, Ended ->
+        w.on_wait () ;
+        ignore (sync (wake_event w)) ;
         step r
-    | exception Frame.Connection_error {code; reason} ->
-        connection_error r code reason
-    | exception (End_of_file | Flow.Closed) ->
-        input_ended r ; step r
+    | _, (Reading | Draining) -> (
+      match Frame.read r.frames ~max_size:max_frame with
+      | frame -> (
+        match on_frame r frame with
+        | Ok None ->
+            step r
+        | Ok (Some Error.No_error) ->
+            drain r "the client sent GOAWAY" ;
+            step r
+        | Ok (Some _) ->
+            (* A GOAWAY of the client with an error: each fiber is cancelled. *)
+            finish r `Error
+        | Error (code, reason) ->
+            connection_error r code reason )
+      | exception Flow.Timeout ->
+          step r
+      | exception Frame.Connection_error {code; reason} ->
+          connection_error r code reason
+      | exception (End_of_file | Flow.Closed) ->
+          input_ended r ; step r )
+
+(* The connection preface. A bad preface closes the connection at once, with no
+   GOAWAY. *)
+and preface r =
+  match Reader.ensure r.frames (String.length Frame.preface) with
+  | () when Reader.sub_string r.frames 0 24 = Frame.preface ->
+      Reader.consume r.frames 24 ;
+      locked r.c (fun () ->
+          r.c.start <- Before_settings ;
+          List.iter (push_zero r.c) (Conn_state.start_frames r.c.cs) ) ;
+      step r
+  | () | (exception (End_of_file | Flow.Closed)) ->
+      finish ~linger:false r `Error
+  | exception Flow.Timeout ->
+      step r
 
 type probe =
   { state: Conn_state.t
   ; records: unit -> int
   ; live: unit -> int
   ; inbound: unit -> int
-  ; scratch: unit -> int }
+  ; scratch: unit -> int
+  ; table_size: unit -> int }
 
-let serve ?local ?(inspect = ignore) : Engine.t =
+type hooks =
+  { inspect: probe -> unit
+  ; on_yield: unit -> unit
+  ; on_wait: unit -> unit
+  ; on_step: unit -> unit }
+
+let no_hooks =
+  {inspect= ignore; on_yield= ignore; on_wait= ignore; on_step= ignore}
+
+let serve ?local ?(hooks = no_hooks) : Engine.t =
  fun ctx flow handler ->
   let config = ctx.config in
   let local = Option.value local ~default:(default_local config) in
+  let now = Time.now Mono in
   let c =
     { m= Fiber.Mutex.create ()
     ; work= Fiber.Condition.create ()
@@ -1335,8 +1575,16 @@ let serve ?local ?(inspect = ignore) : Engine.t =
     ; sending= Queue.create ()
     ; phase= Serving
     ; broken= false
-    ; reading= true
     ; live= 0
+    ; idle_since= now
+    ; started= now
+    ; exact= exact_idle config
+    ; kick= Var.create 0
+    ; start= Before_preface
+    ; input= Reading
+    ; block_since= None
+    ; stopping= false
+    ; due= false [@mutate off "a due at the start costs one read of the timers"]
     ; seq= (0 [@mutate off "the item numbers only compare with each other"])
     ; flushed=
         (0
@@ -1349,16 +1597,22 @@ let serve ?local ?(inspect = ignore) : Engine.t =
     ; scratch= [||] }
   in
   let sum f = Hashtbl.fold (fun _ s n -> n + f s) c.streams 0 in
-  inspect
+  hooks.inspect
     { state= c.cs
     ; records= (fun () -> Hashtbl.length c.streams)
     ; live= (fun () -> c.live)
     ; inbound= (fun () -> sum (fun s -> Bytes.length s.data))
-    ; scratch= (fun () -> Array.length c.scratch) } ;
+    ; scratch= (fun () -> Array.length c.scratch)
+    ; table_size= (fun () -> Hpack.Decoder.table_size c.decoder) } ;
   Flow.set_write_timeout flow (Some config.write_timeout) ;
-  let seen = ref (Var.view c.wake) in
+  let w =
+    { seen= Var.view c.wake
+    ; on_yield= hooks.on_yield
+    ; on_wait= hooks.on_wait
+    ; on_step= hooks.on_step }
+  in
   let input =
-    Flow.make ~read:(guarded c flow seen) ~read_now:(Flow.read_now flow)
+    Flow.make ~read:(guarded c w flow) ~read_now:(Flow.read_now flow)
       ~write:(Flow.write flow) ~readable:(Flow.readable flow)
       ~shutdown_send:(fun () -> Flow.shutdown_send flow)
       ~close:(fun () -> Flow.close flow)
@@ -1368,6 +1622,8 @@ let serve ?local ?(inspect = ignore) : Engine.t =
   in
   Fiber.scope
   @@ fun scope ->
+  Fiber.fork_daemon ~name:"caravan.h2.watchdog" scope (fun () ->
+      watchdog c (Conn_info.stopping ctx.conn) ~stop_open:true ) ;
   let r =
     { c
     ; ctx
@@ -1375,7 +1631,7 @@ let serve ?local ?(inspect = ignore) : Engine.t =
     ; handler
     ; scope
     ; frames= Reader.create ~size:65536 input
-    ; seen
+    ; w
     ; writer_fiber=
         Fiber.fork_promise ~name:"caravan.h2.writer" scope (fun () ->
             writer c flow )
@@ -1386,14 +1642,4 @@ let serve ?local ?(inspect = ignore) : Engine.t =
         | `Https ->
             "https" ) }
   in
-  (* The connection preface. W has nothing to write before it, thus [wake] does
-     not change and the guarded read raises no [Flow.Timeout]. A bad preface
-     closes the connection at once, with no GOAWAY. *)
-  match Reader.ensure r.frames (String.length Frame.preface) with
-  | () when Reader.sub_string r.frames 0 24 = Frame.preface ->
-      Reader.consume r.frames 24 ;
-      locked c (fun () ->
-          List.iter (push_zero c) (Conn_state.start_frames c.cs) ) ;
-      step r
-  | () | (exception (End_of_file | Flow.Closed)) ->
-      finish ~linger:false r `Error
+  step r

@@ -12,8 +12,8 @@
 
     {b The closed set.} The state keeps the last
     [min (4 * max_concurrent_streams) 4096] closed identifiers, each with its
-    kind: "reset by us", "ignored" or "ended" (ended in the two directions, or
-    reset by the client). A frame on such an identifier gets the rule of its
+    kind: "reset by us", "ignored", "ended" (ended in the two directions) or
+    "reset by the client". A frame on such an identifier gets the rule of its
     kind. A closed identifier that left the set is closed with no kind: DATA on
     it gives connection credit and is ignored, but HEADERS and CONTINUATION on
     it give [PROTOCOL_ERROR] (see {!on_frame}).
@@ -32,6 +32,10 @@
       a body that is too short.
     - A {!event.Header_block} with [Reset PROTOCOL_ERROR] for trailers that
       depend on their own stream.
+    - A {!event.Stream_error} for a malformed frame (for example a PRIORITY
+      frame with a bad length) on a stream that ended in the two directions.
+      Then the stream becomes "reset by us" (h2spec http2/6.3/2). A malformed
+      frame on a stream of another closed kind is ignored.
 
     {b The time rules of the engine.}
     - The engine calls {!end_local} in the critical section that queues the
@@ -208,6 +212,9 @@ val peer_max_frame_size : t -> int
 
 val active_streams : t -> int
 (** [active_streams t] is the count of the open and half-closed streams. *)
+
+val block_open : t -> bool
+(** [block_open t] is [true] while a header block waits for its END_HEADERS. *)
 
 val known_streams : t -> int
 (** [known_streams t] is the count of the stream records: the active streams,

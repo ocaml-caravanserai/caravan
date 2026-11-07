@@ -1411,10 +1411,30 @@ let conn_state_rows =
           (error_text Protocol_error) ;
         let t = started () in
         gives t (malformed 2) (error_text Frame_size_error) )
-  ; test "Malformed on a closed id is ignored" (fun () ->
+  ; test
+      "Malformed on a closed id: a stream error after the two ends, else none"
+      (fun () ->
         List.iter
-          (fun (_, t, stream) -> gives t (malformed stream) [])
-          (closed_kinds ()) )
+          (fun (name, t, stream) ->
+            if name = "ended" then begin
+              (* h2spec http2/6.3/2: our END_STREAM can wait in the queue. *)
+              gives t (malformed stream)
+                [sprintf "stream error %d FRAME_SIZE_ERROR" stream] ;
+              (* The stream is then "reset by us": DATA is ignored, and a second
+                 malformed frame gives nothing. *)
+              gives t (malformed stream) [] ;
+              gives t (data stream "x") []
+            end
+            else gives t (malformed stream) [] )
+          (closed_kinds ()) ;
+        (* The same after the engine discarded the stream: only the closed set
+           has it. *)
+        let t = started () in
+        ended t 1 ;
+        ignore (Conn_state.discard t ~stream:1) ;
+        gives t (malformed 1) ["stream error 1 FRAME_SIZE_ERROR"] ;
+        gives t (malformed 1) [] ;
+        gives t (data 1 "x") [] )
   ; test "a bad local value" (fun () ->
         Conn_state.validate local ;
         Conn_state.validate

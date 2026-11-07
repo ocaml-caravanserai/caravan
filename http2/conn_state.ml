@@ -33,9 +33,9 @@ let max_closed = 4096
    under this limit, gets the 431 response of the engine, not a GOAWAY. *)
 let min_block = 65536
 
-(* The kinds of the closed set. [Ended]: the stream ended in the two directions,
-   or the client reset it. *)
-type kind = Reset_by_us | Ignored_id | Ended
+(* The kinds of the closed set. [Ended]: the stream ended in the two directions.
+   [Reset_by_peer]: the client reset it. *)
+type kind = Reset_by_us | Ignored_id | Ended | Reset_by_peer
 
 (* A stream that [Open] opened. [closed] is [None] while the stream is active
    (open or half-closed). The record stays until the stream is closed and the
@@ -162,6 +162,11 @@ let remember t id kind =
   if Queue.length t.order > t.capacity then
     Hashtbl.remove t.closed_set (Queue.pop t.order)
 
+(* [rekind t id kind]: the closed stream [id] changes its kind. *)
+let rekind t id kind =
+  Option.iter (fun s -> s.closed <- Some kind) (Hashtbl.find_opt t.streams id) ;
+  if Hashtbl.mem t.closed_set id then Hashtbl.replace t.closed_set id kind
+
 (* [close t s kind] closes the active stream [s]. *)
 let close t s kind =
   t.active <- t.active - 1 ;
@@ -286,7 +291,7 @@ let headers_use t ~live ~stream ~end_stream ~self_dependent =
       end
   | Closed (Reset_by_us | Ignored_id) ->
       Ok Ignored
-  | Closed Ended ->
+  | Closed (Ended | Reset_by_peer) ->
       error Stream_closed "HEADERS on a closed stream"
   | Closed_unknown ->
       (* Step 2. The plan row tells STREAM_CLOSED for an id that left the closed
@@ -368,7 +373,7 @@ let on_data t ~stream ~end_stream ~data ~flow_length =
   | Idle ->
       (* h2spec http2/5.1/1 *)
       error Protocol_error "DATA on an idle stream"
-  | Closed Ended ->
+  | Closed (Ended | Reset_by_peer) ->
       (* h2spec http2/5.1/8, http2/5.1/11, http2/6.1/2 *)
       error Stream_closed "DATA on a closed stream"
   | _ when flow_length > t.conn_recv ->
@@ -413,7 +418,7 @@ let on_rst_stream t ~stream =
       (* h2spec http2/5.1/2, http2/6.4/2 *)
       error Protocol_error "RST_STREAM on an idle stream"
   | Active s ->
-      close t s Ended ;
+      close t s Reset_by_peer ;
       Ok [Peer_reset {stream}]
   | Closed _ | Closed_unknown ->
       Ok []
@@ -549,7 +554,12 @@ let on_other t ~live (frame : Frame.t) =
     | Idle ->
         (* h2spec http2/5.3.1/2 *)
         Error (code, reason)
-    | Closed _ | Closed_unknown ->
+    | Closed Ended ->
+        (* h2spec http2/6.3/2: our END_STREAM can wait in the queue of the
+           engine, thus for the client the stream is open. *)
+        rekind t stream Reset_by_us ;
+        Ok [Stream_error {stream; code}]
+    | Closed (Reset_by_us | Ignored_id | Reset_by_peer) | Closed_unknown ->
         Ok [] )
 
 let on_frame t ~live (frame : Frame.t) =
@@ -606,6 +616,8 @@ let goaway t code debug =
 let peer_max_frame_size t = t.peer_max_frame
 
 let active_streams t = t.active
+
+let block_open t = Option.is_some t.block
 
 let known_streams t = Hashtbl.length t.streams
 

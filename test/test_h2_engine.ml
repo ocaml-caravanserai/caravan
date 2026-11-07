@@ -536,7 +536,8 @@ let serve_with ?local ?(config = config) ?settings ?(wrap = Fun.id) sim handler
           let call =
             Sim_support.call ~name:"engine" s (fun () ->
                 H2_server.serve ?local
-                  ~inspect:(fun p -> probe := Some p)
+                  ~hooks:
+                    {H2_server.no_hooks with inspect= (fun p -> probe := Some p)}
                   (ctx config) (wrap flow) handler ;
                 try Flow.shutdown_send flow with Flow.Closed -> () )
           in
