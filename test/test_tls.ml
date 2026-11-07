@@ -180,6 +180,19 @@ let rsa_leaf =
          (X509.Signing_request.sign csr ~valid_from ~valid_until key dn)
      , key ) )
 
+(* [signature_algorithms ciphers] are the signature algorithms of the key types
+   of [ciphers]. ocaml-tls 2.1.4 and later refuse a cipher list (of a server or
+   of a client) with no key type of each default signature algorithm, for
+   example the list of one ECDSA cipher suite. ocaml-tls gives the key type RSA
+   to the cipher suites of TLS 1.3, thus a list with one of them needs an RSA
+   algorithm, and an RSA key if the list has no ECDSA cipher suite. *)
+let signature_algorithms ciphers =
+  let has k =
+    List.exists (fun c -> Tls.Ciphersuite.ciphersuite_keytype c = k)
+  in
+  (if has `RSA ciphers then [`RSA_PSS_RSAENC_SHA256; `RSA_PKCS1_SHA256] else [])
+  @ if has `EC ciphers then [`ECDSA_SECP256R1_SHA256] else []
+
 (* [server_config ~rsa ~alpn ~version ~ciphers ~reneg ()] is a server
    configuration with a new test certificate (a P-256 key), or with an RSA key
    if [rsa]. It seeds the generator first, thus a test that uses it does not
@@ -193,7 +206,9 @@ let server_config ?(rsa = false) ~alpn ?version ?ciphers ?reneg ?zero_rtt () =
       (leaf, key)
   in
   match
-    Tls.Config.server ?version ?ciphers ?reneg ?zero_rtt
+    Tls.Config.server ?version ?ciphers
+      ?signature_algorithms:(Option.map signature_algorithms ciphers)
+      ?reneg ?zero_rtt
       ~certificates:(`Single ([leaf], key))
       ~alpn_protocols:alpn ()
   with
@@ -593,7 +608,9 @@ let engine_tests =
                   (Tls.Config.client
                      ~authenticator:(fun ?ip:_ ~host:_ _ -> Ok None)
                      ~peer_name:Tls_support.localhost
-                     ~version:(`TLS_1_2, `TLS_1_2) ~ciphers:[cbc] () )
+                     ~version:(`TLS_1_2, `TLS_1_2) ~ciphers:[cbc]
+                     ~signature_algorithms:(signature_algorithms [cbc])
+                     () )
               in
               is_true ~msg:"HTTP/1.1"
                 (String.starts_with ~prefix:"HTTP/1.1 " (preface_reply ccfg)) ;
@@ -634,8 +651,8 @@ let engine_tests =
               , None
               , [`ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256]
               , None )
-            ; ( "the cipher suites of TLS 1.3"
-              , false
+            ; ( "the cipher suites of TLS 1.3, RSA key"
+              , true
               , ["h2"]
               , None
               , [ `AES_128_GCM_SHA256
