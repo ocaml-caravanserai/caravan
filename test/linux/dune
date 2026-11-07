@@ -63,3 +63,12 @@
   (= %{system} linux))
  (modules autobahn_server)
  (libraries caravan caravan.websocket weft weft.linux))
+
+; The server of make h2spec: HTTP/2 with prior knowledge.
+
+(executable
+ (name h2spec_server)
+ (enabled_if
+  (= %{system} linux))
+ (modules h2spec_server)
+ (libraries caravan caravan.http2 weft weft.linux))

@@ -1,5 +1,5 @@
 
-.PHONY: build fmt test mutate coverage autobahn
+.PHONY: build fmt test mutate coverage autobahn h2spec
 
 build:
 	dune build
@@ -68,3 +68,20 @@ autobahn:
 	  $(AUTOBAHN)/reports/servers/index.json
 	jq -e '[.caravan[] | select(.behavior == "FAILED" or .behaviorClose == "FAILED")] | length == 0' \
 	  $(AUTOBAHN)/reports/servers/index.json > /dev/null
+
+# The h2spec conformance suite of HTTP/2 (h2spec of the dev shell) in strict
+# mode (also the SHOULD cases), against HTTP/2 with prior knowledge (h2c) on
+# 127.0.0.1:$(H2SPEC_PORT). The server reads each request body and answers 200
+# with a body. Its output goes to $(H2SPEC_LOG). The target fails if a case
+# fails, and then shows that output. The dune root is the directory of this
+# Makefile, also in a worktree.
+H2SPEC_PORT ?= 18443
+H2SPEC_LOG := _build/h2spec-server.log
+
+h2spec:
+	dune build --root . test/linux/h2spec_server.exe
+	./_build/default/test/linux/h2spec_server.exe $(H2SPEC_PORT) > $(H2SPEC_LOG) 2>&1 & server=$$!; \
+	trap 'kill $$server 2>/dev/null' EXIT INT TERM; \
+	for i in $$(seq 50); do grep -q '^listening' $(H2SPEC_LOG) && break; sleep 0.1; done; \
+	grep -q '^listening' $(H2SPEC_LOG) || { echo "The server did not start."; exit 1; }; \
+	h2spec -S -h 127.0.0.1 -p $(H2SPEC_PORT) -o 3 || { cat $(H2SPEC_LOG); exit 1; }
