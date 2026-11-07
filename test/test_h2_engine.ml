@@ -5057,6 +5057,255 @@ let limits_tests =
           equal Testable.(triple int bool bool) (6 * 49, true, false) r.value ;
           clean_end r ) ]
 
+(* {1 The selection of the engine: Caravan_http2.auto} *)
+
+(* [select ~tls ~alpn ~stop ~config ~http1 sim f] runs [Caravan_http2.auto
+   ~http1] with [hello] on a TCP pair, and [f s flow call] with the client flow
+   [flow] and the call [call] of the engine. The connection has the scheme https
+   if [tls] or [alpn], and the ALPN protocol [alpn] (none by default). After
+   [f], the client ends its stream, and the engine must return. It gives the
+   value of [f] and the reports. *)
+let select ?(tls = false) ?alpn ?stop ?(config = config) ~http1 sim f =
+  let reports = ref [] in
+  let config =
+    { config with
+      on_error= (fun e _ -> reports := Printexc.to_string e :: !reports) }
+  in
+  let ctx = ctx ?stop config in
+  let ctx =
+    if tls || Option.is_some alpn then
+      {ctx with conn= Conn_info.with_tls ?alpn ctx.conn}
+    else ctx
+  in
+  let engine = Caravan_http2.auto ~http1 () in
+  let value =
+    Sim_support.with_pair sim (fun client server ->
+        Fiber.scope (fun s ->
+            let call =
+              Sim_support.call ~name:"engine" s (fun () ->
+                  let flow = Tcp.flow server in
+                  Fun.protect
+                    ~finally:(fun () ->
+                      Fiber.shield (fun () ->
+                          try Flow.shutdown_send flow with Flow.Closed -> () ) )
+                    (fun () -> engine ctx flow hello) )
+            in
+            let flow = Tcp.flow client in
+            let value = f s flow call in
+            (try Flow.shutdown_send flow with Flow.Closed -> ()) ;
+            Sim_support.await call ; value ) )
+  in
+  (value, List.rev !reports)
+
+(* A stub of the HTTP/1.1 engine: it reads its flow to the end, and keeps the
+   bytes in [got]. *)
+let stub_http1 got : Caravan.Engine.t =
+ fun _ flow _ -> got := Some (read_all flow)
+
+(* An HTTP/1.1 engine that must not run. *)
+let no_http1 : Caravan.Engine.t = fun _ _ _ -> raise (failed "http1 ran")
+
+(* [h2_get s flow] sends a GET with the fake client on [flow], and gives the
+   body of the response. Then the client ends its stream. *)
+let h2_get s flow =
+  let c = Fake.connect s flow in
+  Fake.request c ~stream:1 get ;
+  let body = (Fake.response c ~stream:1).body in
+  Fake.close c ; Fake.finish c ; body
+
+let h1_request = "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"
+
+(* [ends_with_hello r] is [true] if the response [r] of HTTP/1.1 has the status
+   200 and the body "hello". *)
+let ends_with_hello r =
+  String.starts_with ~prefix:"HTTP/1.1 200" r
+  && String.ends_with ~suffix:"\r\n\r\nhello" r
+
+let sleep span = sync (Time.after Mono span)
+
+let select_tests =
+  group "Engine selection"
+    [ test "ALPN h2: HTTP/2" (fun () ->
+          let body, reports =
+            Sim_support.run (fun sim ->
+                select ~alpn:"h2" ~http1:no_http1 sim (fun s flow _ ->
+                    h2_get s flow ) )
+          in
+          equal Testable.string "hello" body ;
+          equal Testable.(list string) [] reports )
+    ; test "ALPN http/1.1: http1 gets each byte, also a preface" (fun () ->
+          let got = ref None in
+          let (), reports =
+            Sim_support.run (fun sim ->
+                select ~alpn:"http/1.1" ~http1:(stub_http1 got) sim
+                  (fun _ flow _ ->
+                    Flow.write_string flow (Frame.preface ^ "x") ) )
+          in
+          equal Testable.(option string) (Some (Frame.preface ^ "x")) !got ;
+          equal Testable.(list string) [] reports )
+    ; test "TLS with no ALPN: http1 gets each byte, also a preface" (fun () ->
+          let got = ref None in
+          let (), reports =
+            Sim_support.run (fun sim ->
+                select ~tls:true ~http1:(stub_http1 got) sim (fun _ flow _ ->
+                    Flow.write_string flow (Frame.preface ^ "x") ) )
+          in
+          equal Testable.(option string) (Some (Frame.preface ^ "x")) !got ;
+          equal Testable.(list string) [] reports )
+    ; test "no ALPN: a short HTTP/1.1 request is served at once" (fun () ->
+          let (r, at), reports =
+            Sim_support.run (fun sim ->
+                select ~http1:Caravan.Server.http1 sim (fun _ flow _ ->
+                    let t0 = Time.now Mono in
+                    Flow.write_string flow h1_request ;
+                    let r = read_all flow in
+                    (r, since t0) ) )
+          in
+          is_true ~msg:r (ends_with_hello r) ;
+          equal Testable.int64 0L at ;
+          equal Testable.(list string) [] reports )
+    ; test "no ALPN: an HTTP/1.1 head larger than the buffer of the sniff"
+        (fun () ->
+          let request =
+            Printf.sprintf
+              "GET / HTTP/1.1\r\n\
+               Host: a\r\n\
+               X-Long: %s\r\n\
+               Connection: close\r\n\
+               \r\n"
+              (String.make 3000 'v')
+          in
+          let r, reports =
+            Sim_support.run (fun sim ->
+                select ~http1:Caravan.Server.http1 sim (fun _ flow _ ->
+                    Flow.write_string flow request ;
+                    read_all flow ) )
+          in
+          is_true ~msg:r (ends_with_hello r) ;
+          equal Testable.(list string) [] reports )
+    ; test "no ALPN: the preface goes to HTTP/2" (fun () ->
+          let body, reports =
+            Sim_support.run (fun sim ->
+                select ~http1:no_http1 sim (fun s flow _ -> h2_get s flow) )
+          in
+          equal Testable.string "hello" body ;
+          equal Testable.(list string) [] reports )
+    ; test "no ALPN: a preface of one byte at a time goes to HTTP/2" (fun () ->
+          let first, reports =
+            Sim_support.run (fun sim ->
+                select ~http1:no_http1 sim (fun _ flow _ ->
+                    String.iter
+                      (fun ch ->
+                        Flow.write_string flow (String.make 1 ch) ;
+                        sleep (Span.ms 1) )
+                      Frame.preface ;
+                    (* The server sends its SETTINGS frame first. *)
+                    let r = Reader.create flow in
+                    brief (Frame.read r ~max_size:16384) ) )
+          in
+          equal Testable.string "SETTINGS" (String.sub first 0 8) ;
+          equal Testable.(list string) [] reports )
+    ; test
+        "no ALPN: PRI that differs at byte 23 goes to HTTP/1.1 with each byte"
+        (fun () ->
+          let got = ref None in
+          let text = String.sub Frame.preface 0 22 ^ "X\r\nmore" in
+          let (), reports =
+            Sim_support.run (fun sim ->
+                select ~http1:(stub_http1 got) sim (fun _ flow _ ->
+                    (* Two writes: the first is a part of the preface. *)
+                    Flow.write_string flow (String.sub text 0 16) ;
+                    sleep (Span.ms 1) ;
+                    Flow.write_string flow
+                      (String.sub text 16 (String.length text - 16)) ) )
+          in
+          equal Testable.(option string) (Some text) !got ;
+          equal Testable.(list string) [] reports )
+    ; test "no ALPN: the last byte of the preface differs" (fun () ->
+          let got = ref None in
+          let text = String.sub Frame.preface 0 23 ^ "\r" in
+          let (), reports =
+            Sim_support.run (fun sim ->
+                select ~http1:(stub_http1 got) sim (fun _ flow _ ->
+                    Flow.write_string flow text ) )
+          in
+          equal Testable.(option string) (Some text) !got ;
+          equal Testable.(list string) [] reports )
+    ; test
+        "no ALPN: a part of the preface, then silence: the close at \
+         header_timeout" (fun () ->
+          let (out, at), reports =
+            Sim_support.run (fun sim ->
+                select ~config:timed ~http1:no_http1 sim (fun _ flow _ ->
+                    let t0 = Time.now Mono in
+                    Flow.write_string flow "PRI * HTTP/2.0\r\n" ;
+                    let out = read_all flow in
+                    (out, since t0) ) )
+          in
+          equal Testable.string "" out ;
+          equal Testable.int64 (Span.to_ns timed.header_timeout) at ;
+          equal Testable.(list string) [] reports )
+    ; test
+        "no ALPN: a slow preface (a byte each 50 ms): the close at \
+         header_timeout" (fun () ->
+          let at, reports =
+            Sim_support.run (fun sim ->
+                select ~config:timed ~http1:no_http1 sim (fun s flow call ->
+                    let t0 = Time.now Mono in
+                    Fiber.fork s (fun () ->
+                        try
+                          String.iter
+                            (fun ch ->
+                              if not (Sim_support.ended sim call) then (
+                                Flow.write_string flow (String.make 1 ch) ;
+                                sleep (Span.ms 50) ) )
+                            Frame.preface
+                        with Flow.Closed -> () ) ;
+                    Sim_support.await call ;
+                    since t0 ) )
+          in
+          equal Testable.int64 (Span.to_ns timed.header_timeout) at ;
+          equal Testable.(list string) [] reports )
+    ; test "no ALPN: the end of the input before a decision: the close"
+        (fun () ->
+          let (out, at), reports =
+            Sim_support.run (fun sim ->
+                select ~http1:no_http1 sim (fun _ flow _ ->
+                    let t0 = Time.now Mono in
+                    Flow.write_string flow "PRI" ;
+                    Flow.shutdown_send flow ;
+                    let out = read_all flow in
+                    (out, since t0) ) )
+          in
+          equal Testable.string "" out ;
+          equal Testable.int64 0L at ;
+          equal Testable.(list string) [] reports )
+    ; test "no ALPN: a stop of the server in the sniff: the close at once"
+        (fun () ->
+          let stop = Ivar.create () in
+          let (out, at), reports =
+            Sim_support.run (fun sim ->
+                select ~stop ~http1:no_http1 sim (fun _ flow _ ->
+                    Flow.write_string flow "PR" ;
+                    sleep (Span.ms 10) ;
+                    let t0 = Time.now Mono in
+                    Ivar.fill stop () ;
+                    let out = read_all flow in
+                    (out, since t0) ) )
+          in
+          equal Testable.string "" out ;
+          equal Testable.int64 0L at ;
+          equal Testable.(list string) [] reports )
+    ; test "engine and auto call Settings.validate" (fun () ->
+          let bad = {Settings.default with frame_tokens= 0} in
+          let refusal = "Caravan_http2.Settings: frame_tokens 0" in
+          raises (Invalid_argument refusal) (fun () ->
+              ignore (Caravan_http2.engine ~settings:bad () : Caravan.Engine.t) ) ;
+          raises (Invalid_argument refusal) (fun () ->
+              ignore
+                ( Caravan_http2.auto ~settings:bad ~http1:no_http1 ()
+                  : Caravan.Engine.t ) ) ) ]
+
 let () =
   exit
     (Windtrap.run "h2_engine"
@@ -5064,4 +5313,5 @@ let () =
        ; engine_tests
        ; rule_tests
        ; lifecycle_tests
-       ; limits_tests ] )
+       ; limits_tests
+       ; select_tests ] )

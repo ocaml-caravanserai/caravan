@@ -137,7 +137,9 @@
  (libraries
   caravan
   caravan.client
+  caravan.http2
   caravan.tls
+  fake_h2_client
   caravan.testing
   sim_support
   tls_support
